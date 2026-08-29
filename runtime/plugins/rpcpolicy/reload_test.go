@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -201,4 +202,147 @@ func TestInitializePanicsOnAnUnloadableConfig(t *testing.T) {
 
 func sprintfConfig(format string, arg string) string {
 	return fmt.Sprintf(format, arg)
+}
+
+// The whole reload transaction -- read, hash compare, parse, build, store,
+// event -- is one critical section. The file poller and the SIGHUP handler are
+// independent triggers; interleaved, the reload that read the OLDER bytes could
+// store LAST and leave the process running a stale registry with the newer
+// file's event already in the log.
+func TestReloadTransactionIsSerialized(t *testing.T) {
+	s, path := newWatchedState(t, sprintfConfig(twoProfileConfig, "10ms"))
+
+	bodyA := sprintfConfig(twoProfileConfig, "111ms")
+	bodyB := sprintfConfig(twoProfileConfig, "222ms")
+
+	reachedA := make(chan struct{})
+	releaseA := make(chan struct{})
+	var once sync.Once
+	s.reloadHook = func(stage string) {
+		if stage != reloadStageRead {
+			return
+		}
+		once.Do(func() {
+			close(reachedA)
+			<-releaseA
+		})
+	}
+
+	writeFile(t, path, bodyA)
+	doneA := make(chan struct{})
+	go func() { defer close(doneA); s.reload() }()
+	<-reachedA // A has read bodyA and is holding the transaction open
+
+	// B is triggered mid-transaction and sees the NEWER file.
+	writeFile(t, path, bodyB)
+	doneB := make(chan struct{})
+	go func() { defer close(doneB); s.reload() }()
+
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, 10*time.Millisecond, s.registry.Load().Lookup("", testMethod).timeout,
+		"no reload may store while another is mid-transaction")
+
+	close(releaseA)
+	<-doneA
+	<-doneB
+
+	assert.Equal(t, 222*time.Millisecond, s.registry.Load().Lookup("", testMethod).timeout,
+		"the reload that read the newest bytes is the one left installed")
+	events := readRecords(t, s.log.Path())
+	require.Len(t, events, 2)
+	assert.Equal(t, sha256Hex([]byte(bodyA)), events[0]["sha256"])
+	assert.Equal(t, sha256Hex([]byte(bodyB)), events[1]["sha256"])
+	assert.Equal(t, sha256Hex([]byte(bodyB)), s.registry.Load().SHA256())
+}
+
+// `server:` is not hot-reloaded in BOTH directions: a process that started
+// without an admission station must not acquire one when a reload adds the
+// block, any more than an existing station may be resized.
+func TestReloadDoesNotAddAStationThatWasAbsent(t *testing.T) {
+	s, path := newWatchedState(t, "default_policy: a\nprofiles:\n  a:\n    timeout: 10ms\n")
+	require.Nil(t, s.registry.Load().Station())
+
+	writeFile(t, path, "default_policy: a\nprofiles:\n  a:\n    timeout: 10ms\nserver:\n  workers: 4\n  queue_capacity: 2\n")
+	s.reload()
+
+	after := s.registry.Load()
+	assert.Nil(t, after.Station(), "a reload may not conjure a station into a running process")
+	assert.Nil(t, after.server)
+	assert.Equal(t, 10*time.Millisecond, after.Lookup("", testMethod).timeout, "the profiles did reload")
+
+	events := readRecords(t, s.log.Path())
+	require.Len(t, events, 1)
+	assert.Equal(t, eventPolicyReload, events[0]["name"])
+	assert.Contains(t, events[0]["note"].(string), "not hot-reloaded")
+
+	// A reload that does not touch the block says nothing extra.
+	writeFile(t, path, "default_policy: a\nprofiles:\n  a:\n    timeout: 20ms\n")
+	s.reload()
+	events = readRecords(t, s.log.Path())
+	require.Len(t, events, 2)
+	assert.NotContains(t, keysOf(events[1]), "note")
+}
+
+// An unreadable config file is not "no change": ONE policy_reload_failed, then
+// silence until the next successful read, and the old registry stays live.
+func TestUnreadableConfigEmitsOneFailureEvent(t *testing.T) {
+	s, path := newWatchedState(t, sprintfConfig(twoProfileConfig, "10ms"))
+	before := s.registry.Load()
+	require.NoError(t, os.Remove(path))
+
+	for i := 0; i < 3; i++ {
+		s.reload()                        // the read path
+		s.noteReadFailure(os.ErrNotExist) // the poller's stat path
+	}
+	assert.Same(t, before, s.registry.Load(), "an unreadable file keeps the old registry")
+	events := readRecords(t, s.log.Path())
+	require.Len(t, events, 1)
+	assert.Equal(t, eventPolicyReloadFailed, events[0]["name"])
+	assert.Contains(t, events[0]["note"].(string), "cannot read")
+
+	// A successful read re-arms the report.
+	writeFile(t, path, sprintfConfig(twoProfileConfig, "44ms"))
+	s.reload()
+	require.NoError(t, os.Remove(path))
+	s.reload()
+	s.reload()
+
+	events = readRecords(t, s.log.Path())
+	require.Len(t, events, 3)
+	assert.Equal(t, eventPolicyReload, events[1]["name"])
+	assert.Equal(t, eventPolicyReloadFailed, events[2]["name"])
+}
+
+// The poller stats the file five times a second, so a deleted file must cost
+// ONE line rather than five a second for the rest of the run.
+func TestFileWatcherReportsAVanishedFileOnce(t *testing.T) {
+	s, path := newLiveState(t, sprintfConfig(twoProfileConfig, "10ms"))
+	before := s.registry.Load()
+	require.NoError(t, os.Remove(path))
+
+	require.Eventually(t, func() bool {
+		return len(readRecords(t, s.log.Path())) == 1
+	}, 3*time.Second, 20*time.Millisecond)
+	time.Sleep(4 * reloadPollInterval)
+
+	recs := readRecords(t, s.log.Path())
+	require.Len(t, recs, 1, "the failure is reported once, not once per tick")
+	assert.Equal(t, eventPolicyReloadFailed, recs[0]["name"])
+	assert.Same(t, before, s.registry.Load())
+}
+
+// shutdown JOINS the watchers before closing the log, so no goroutine can write
+// a reload event into a closed file and have it silently accepted.
+func TestShutdownJoinsTheWatchersBeforeClosingTheLog(t *testing.T) {
+	s, path := newLiveState(t, sprintfConfig(twoProfileConfig, "10ms"))
+	s.shutdown()
+
+	assert.ErrorIs(t, s.log.Write(&EventRecord{Kind: "event", Name: "after-close"}), ErrLogClosed)
+	assert.ErrorIs(t, s.log.Flush(), ErrLogClosed)
+
+	before := s.registry.Load()
+	writeFile(t, path, sprintfConfig(twoProfileConfig, "999ms"))
+	time.Sleep(4 * reloadPollInterval)
+	assert.Same(t, before, s.registry.Load(), "the watchers are gone")
+	assert.Empty(t, readRecords(t, s.log.Path()))
 }

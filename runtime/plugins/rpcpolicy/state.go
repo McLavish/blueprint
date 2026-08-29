@@ -36,6 +36,18 @@ type runtimeState struct {
 
 	stopReload chan struct{}
 	stopOnce   sync.Once
+	// watchers joins the file poller and the SIGHUP handler at shutdown, so the
+	// attempt log is never closed underneath a goroutine still writing to it.
+	watchers sync.WaitGroup
+
+	// reloadMu serializes the WHOLE reload transaction (read -> hash -> parse ->
+	// build -> store -> event) across the poller and the signal handler. It also
+	// guards readFailed and reloadHook.
+	reloadMu   sync.Mutex
+	readFailed bool
+	// reloadHook is a test-only barrier inside the transaction. Set before the
+	// watchers start; read under reloadMu.
+	reloadHook func(stage string)
 }
 
 var (
@@ -105,13 +117,19 @@ func initialize(configPath, logDir, service string) *runtimeState {
 	return s
 }
 
-// shutdown stops the reload watcher and flushes the log. Only tests call it;
+// shutdown stops the reload watchers and flushes the log. Only tests call it;
 // a container is killed, not asked politely.
+//
+// The watchers are JOINED before the log is closed. Closing first left the
+// poller and the signal handler free to write a reload event into a closed log,
+// which the writer accepted silently -- a record the pipeline would then never
+// see, with nothing to say it had been dropped.
 func (s *runtimeState) shutdown() {
 	if s == nil || s.inert {
 		return
 	}
 	s.stopOnce.Do(func() { close(s.stopReload) })
+	s.watchers.Wait()
 	_ = s.log.Close()
 }
 

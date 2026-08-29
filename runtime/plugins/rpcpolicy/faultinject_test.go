@@ -2,8 +2,10 @@ package rpcpolicy
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -276,4 +278,148 @@ func TestFaultOnlyAffectsTheMethodTheRuleNames(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "ok", resp)
+}
+
+// msim's _finish_service evaluates _fails_now(now) at the COMPLETION instant
+// (service.py:435 -> :216). A handler that runs INTO a failure window is
+// governed by the probability in force when it finishes; one that runs OUT of
+// the window escapes it, even though it was inside the window when it started.
+// The additive latency is the other half of the fault and is deliberately NOT
+// re-read: it is what occupies the permit, so it is fixed at admission.
+func TestFaultPFailIsEvaluatedAtTheRollInstant(t *testing.T) {
+	base := time.UnixMilli(1_700_000_000_000)
+	const doc = "default_policy: a\nprofiles:\n  a:\n    timeout: 1s\nserver:\n  workers: 2\n  queue_capacity: 4\n"
+
+	for _, tc := range []struct {
+		name        string
+		rules       []FaultRule
+		admitAt     time.Duration
+		finishAt    time.Duration
+		wantFault   bool
+		wantLatency bool
+	}{
+		{
+			// Admitted at 9 s with a latency-only window live and p_fail 0;
+			// finishes at 10.5 s, inside a p_fail 1 window that did not exist at
+			// admission.
+			name: "handler crosses into a failure window",
+			rules: []FaultRule{
+				{Method: testMethod, StartS: 0, EndS: 10, AddLatencyMS: 5},
+				{Method: testMethod, StartS: 10, EndS: 11, PFail: 1},
+			},
+			admitAt: 9 * time.Second, finishAt: 10500 * time.Millisecond,
+			wantFault: true, wantLatency: true,
+		},
+		{
+			// Admitted at 10.5 s inside the p_fail 1 window; finishes at 11.5 s,
+			// after it closed. The latency it was admitted with still applies.
+			name:    "handler crosses out of a failure window",
+			rules:   []FaultRule{{Method: testMethod, StartS: 10, EndS: 11, AddLatencyMS: 5, PFail: 1}},
+			admitAt: 10500 * time.Millisecond, finishAt: 11500 * time.Millisecond,
+			wantFault: false, wantLatency: true,
+		},
+		{
+			name:    "handler stays inside the window",
+			rules:   []FaultRule{{Method: testMethod, StartS: 10, EndS: 11, PFail: 1}},
+			admitAt: 10200 * time.Millisecond, finishAt: 10500 * time.Millisecond,
+			wantFault: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStateWithFaults(t, doc, scheduleOf(tc.rules...), base.UnixMilli(),
+				func() float64 { return 0.0 })
+			var at atomic.Int64
+			at.Store(int64(tc.admitAt))
+			s.faults.now = func() time.Time { return base.Add(time.Duration(at.Load())) }
+
+			_, err := s.serve(context.Background(), nil, testMethod, func(context.Context, interface{}) (interface{}, error) {
+				at.Store(int64(tc.finishAt)) // the handler spans the window edge
+				return "ok", nil
+			})
+
+			recs := s.tlog.ofKind("server")
+			require.Len(t, recs, 1)
+			assert.Equal(t, tc.wantFault, recs[0]["fault_hit"])
+			if tc.wantFault {
+				require.Error(t, err)
+				assert.Equal(t, codes.Unavailable, status.Code(err))
+			} else {
+				require.NoError(t, err)
+			}
+			if tc.wantLatency {
+				assert.GreaterOrEqual(t, recs[0]["injected_ms"], 4.0,
+					"the latency is fixed at admission, where it starts occupying the permit")
+			} else {
+				assert.Equal(t, 0.0, recs[0]["injected_ms"])
+			}
+		})
+	}
+}
+
+// msim converts float seconds and milliseconds with int(round(x)), and Python's
+// round breaks ties to EVEN. math.Round (ties away from zero) disagrees on
+// exactly the half-nanosecond inputs, which is a whole nanosecond of window on
+// either edge.
+func TestDurationConversionRoundsTiesToEven(t *testing.T) {
+	for _, tc := range []struct {
+		s    float64
+		want time.Duration
+	}{
+		{0.5e-9, 0}, // math.Round would say 1
+		{1.5e-9, 2},
+		{2.5e-9, 2}, // math.Round would say 3
+		{3.5e-9, 4},
+		{1.5, 1500 * time.Millisecond},
+	} {
+		got, ok := secondsToDuration(tc.s)
+		require.True(t, ok, "%v s", tc.s)
+		assert.Equal(t, tc.want, got, "%v s", tc.s)
+	}
+	for _, tc := range []struct {
+		ms   float64
+		want time.Duration
+	}{
+		{0.5e-6, 0}, // math.Round would say 1
+		{1.5e-6, 2},
+		{2.5e-6, 2}, // math.Round would say 3
+		{10, 10 * time.Millisecond},
+	} {
+		got, ok := millisToDuration(tc.ms)
+		require.True(t, ok, "%v ms", tc.ms)
+		assert.Equal(t, tc.want, got, "%v ms", tc.ms)
+	}
+
+	// Out of range: float64 -> int64 conversion is undefined in Go for these, so
+	// they are reported rather than converted into an arbitrary anchor.
+	for _, v := range []float64{1e30, -1e30, math.Inf(1), math.Inf(-1), math.NaN(), 9.3e9} {
+		_, ok := secondsToDuration(v)
+		assert.False(t, ok, "%v s must not convert", v)
+	}
+	_, ok := millisToDuration(1e30)
+	assert.False(t, ok)
+}
+
+// The window bounds use the same rounding, so a half-nanosecond start is inside
+// the window at the nanosecond msim would put it in.
+func TestActiveFaultWindowBoundsRoundTiesToEven(t *testing.T) {
+	base := time.UnixMilli(1_700_000_000_000)
+	sched := scheduleOf(FaultRule{Method: testMethod, StartS: 2.5e-9, EndS: 10e-9, PFail: 1})
+	_, pf := activeFault(sched, base.UnixMilli(), base.Add(2), testMethod)
+	assert.Equal(t, 1.0, pf, "start_s 2.5 ns rounds to 2 ns (ties to even), not 3")
+}
+
+// A finite-but-unrepresentable bound is rejected where the file name is still
+// in hand, and never anchors a window arbitrarily.
+func TestLoadFaultsRejectsUnrepresentableBounds(t *testing.T) {
+	dir := t.TempDir()
+	for _, body := range []string{
+		"rules:\n  - method: m\n    start_s: 1e30\n    end_s: 1e31\n",
+		"rules:\n  - method: m\n    start_s: 0\n    end_s: 1e30\n",
+		"rules:\n  - method: m\n    start_s: 0\n    end_s: 1\n    add_latency_ms: 1e30\n",
+	} {
+		path := filepath.Join(dir, "f.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+		_, err := LoadFaults(path)
+		assert.ErrorContains(t, err, "does not fit a time.Duration", "body %q", body)
+	}
 }

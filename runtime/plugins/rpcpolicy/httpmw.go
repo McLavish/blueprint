@@ -44,7 +44,7 @@ func (s *runtimeState) httpMiddleware() func(http.Handler) http.Handler {
 
 			// The root record is the only place the driver's HTTP status and
 			// the trace id meet; root_metrics joins on trace_id.
-			s.log.Write(&RootRecord{
+			_ = s.log.Write(&RootRecord{
 				baseRecord: baseRecord{
 					Kind: "root", TraceID: traceID, SpanID: spanID, ParentSpanID: parentSpanID,
 					Service: s.service, Operation: "HTTP " + r.Method + " " + r.URL.Path,

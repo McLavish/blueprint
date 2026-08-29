@@ -186,3 +186,20 @@ func TestAttemptLogIsConcurrencySafe(t *testing.T) {
 	}
 	assert.Len(t, log.records(), 800)
 }
+
+// A write after Close must be REPORTED, not silently accepted: a record the
+// pipeline never sees, with nothing to say it was dropped, is exactly the
+// failure the attempt log exists to make impossible.
+func TestAttemptLogRejectsWritesAfterClose(t *testing.T) {
+	l := newTestLog(t)
+	require.NoError(t, l.Write(&EventRecord{Kind: "event", Name: "before"}))
+	require.NoError(t, l.Close())
+
+	assert.ErrorIs(t, l.Write(&EventRecord{Kind: "event", Name: "after"}), ErrLogClosed)
+	assert.ErrorIs(t, l.Flush(), ErrLogClosed)
+	require.NoError(t, l.Close(), "Close is idempotent")
+
+	recs := readRecords(t, l.Path())
+	require.Len(t, recs, 1, "the record written after Close never reached the file")
+	assert.Equal(t, "before", recs[0]["name"])
+}

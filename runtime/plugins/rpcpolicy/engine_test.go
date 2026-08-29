@@ -2,6 +2,7 @@ package rpcpolicy
 
 import (
 	"context"
+	"math/big"
 	"testing"
 	"time"
 
@@ -67,7 +68,7 @@ func TestEngineShedRequestDoesNotDepositIntoAWrappedBudget(t *testing.T) {
 	for budget.CanRetry() { // drain, so deposits are visible below the cap
 		budget.NextDelay(ctxAt(1, 0))
 	}
-	require.Equal(t, int64(0), budget.Tokens())
+	requireTokens(t, budget, big.NewInt(0))
 	breaker := mustCountBreaker(t, [2]int{1, 1}, [2]int{1, 1}, 1000*secondNS, budget)
 	breaker.AddResult(false, 0)
 	require.Equal(t, CBOpen, breaker.GetState())
@@ -77,7 +78,7 @@ func TestEngineShedRequestDoesNotDepositIntoAWrappedBudget(t *testing.T) {
 		err := e.execute(context.Background(), prof, "", testMethod, func(context.Context) error { return nil })
 		require.Error(t, err)
 	}
-	assert.Equal(t, int64(0), budget.Tokens())
+	requireTokens(t, budget, big.NewInt(0))
 }
 
 // Results must reach EVERY layer, not just the outermost: RetryBudgetPolicy has
@@ -107,14 +108,14 @@ func TestEngineRequestStartsReachAWrappedBudget(t *testing.T) {
 	for budget.CanRetry() {
 		budget.NextDelay(ctxAt(1, 0))
 	}
-	require.Equal(t, int64(0), budget.Tokens())
+	requireTokens(t, budget, big.NewInt(0))
 	breaker := mustCountBreaker(t, [2]int{1, 1}, [2]int{1, 1}, 0, budget)
 	prof := &profile{name: "p", timeout: 50 * time.Millisecond, retryOn: map[codes.Code]bool{codes.Unavailable: true}, head: breaker}
 
 	for i := 0; i < 3; i++ {
 		require.NoError(t, e.execute(context.Background(), prof, "", testMethod, func(context.Context) error { return nil }))
 	}
-	assert.Equal(t, 3*budget.Deposit(), budget.Tokens())
+	requireTokens(t, budget, big.NewInt(3*budget.Deposit()))
 }
 
 // A retry the global deadline vetoes must not be charged: every throttling
@@ -307,14 +308,16 @@ profiles:
 	err := e.execute(context.Background(), prof, "", testMethod, func(ctx context.Context) error {
 		d, ok := ctx.Deadline()
 		require.True(t, ok, "every attempt carries the profile's per-attempt timeout")
-		budgets = append(budgets, time.Until(d))
+		// Measured on the clock that minted the deadline, so the budget is the
+		// exact per-attempt timeout rather than a real-time approximation of it.
+		budgets = append(budgets, time.Duration(clock.DeadlineNS(d)-clock.NowNS()))
 		clock.Advance(time.Millisecond)
 		return status.Error(codes.Unavailable, "boom")
 	})
 	require.Error(t, err)
 	require.Len(t, budgets, 3)
 	for _, b := range budgets {
-		assert.InDelta(t, float64(40*time.Millisecond), float64(b), float64(5*time.Millisecond))
+		assert.Equal(t, 40*time.Millisecond, b)
 	}
 	recs := log.ofKind("client")
 	require.Len(t, recs, 3)
@@ -411,4 +414,71 @@ func TestEngineMintsAFreshSpanPerAttempt(t *testing.T) {
 		assert.False(t, seen[r["span_id"].(string)])
 		seen[r["span_id"].(string)] = true
 	}
+}
+
+// The strict half-open comparison must be made against the deadline the
+// INVOKER actually received. Deriving the boundary as "now + timeout" on one
+// clock while the attempt context was minted from another put the two on
+// different timelines; a clock that moves between observations exposes it.
+func TestEngineClassifiesAgainstTheDeadlineTheInvokerReceived(t *testing.T) {
+	prof := testProfile(t, "default_policy: a\nprofiles:\n  a:\n    timeout: 50ms\n")
+
+	run := func(offset int64) (codes.Code, *testLog) {
+		clock := newTickClock(time.Millisecond)
+		log := newTestLog(t)
+		e := &engine{clock: clock, log: log.attemptLog, service: "svc-test"}
+		seen := int64(-1)
+		err := e.execute(context.Background(), prof, "", testMethod, func(attemptCtx context.Context) error {
+			d, ok := attemptCtx.Deadline()
+			require.True(t, ok)
+			seen = clock.DeadlineNS(d)
+			// Pin the finish exactly `offset` ns from the invoker's own
+			// deadline; nothing after this point moves the clock.
+			clock.FreezeAt(seen + offset)
+			return nil
+		})
+		require.NotEqual(t, int64(-1), seen, "the invoker must be handed a deadline")
+		return status.Code(err), log
+	}
+
+	code, log := run(-1)
+	assert.Equal(t, codes.OK, code, "one ns before the invoker's own deadline is still a success")
+	assert.Equal(t, "OK", log.ofKind("client")[0]["response_code"])
+
+	code, log = run(0)
+	assert.Equal(t, codes.DeadlineExceeded, code, "finishing AT the invoker's own deadline is a drop")
+	recs := log.ofKind("client")
+	require.Len(t, recs, 1)
+	assert.Equal(t, "DeadlineExceeded", recs[0]["response_code"])
+	assert.Equal(t, dropDeadline, recs[0]["drop_reason"])
+}
+
+// The jittered delays are exact functions of the draw, so a fixed source pins
+// them completely. msim computes them in floats and truncates with int(), which
+// is not the same as rounding: 400 ms x (1 - 1e-9) is 399999999 ns, not 400 ms.
+func TestExponentialJitterExactValuesUnderAFixedSource(t *testing.T) {
+	const (
+		initial = int64(100 * time.Millisecond)
+		cap400  = int64(400 * time.Millisecond)
+	)
+	draws := []float64{0.0, 0.25, 0.5, 0.999999999}
+	source := func() func() float64 {
+		i := 0
+		return func() float64 { r := draws[i]; i++; return r }
+	}
+
+	// exp per attempt: 100 ms, 200 ms, 400 ms, 400 ms (capped).
+	full, err := NewExponentialBackoffWithJitterRetryPolicy(9, initial, cap400, JitterFull, source())
+	require.NoError(t, err)
+	assert.Equal(t, DelayDecision{true, 0}, full.NextDelay(ctxAt(1, 0)))
+	assert.Equal(t, DelayDecision{true, int64(50 * time.Millisecond)}, full.NextDelay(ctxAt(2, 0)))
+	assert.Equal(t, DelayDecision{true, int64(200 * time.Millisecond)}, full.NextDelay(ctxAt(3, 0)))
+	assert.Equal(t, DelayDecision{true, int64(400*time.Millisecond) - 1}, full.NextDelay(ctxAt(4, 0)))
+
+	equal, err := NewExponentialBackoffWithJitterRetryPolicy(9, initial, cap400, JitterEqual, source())
+	require.NoError(t, err)
+	assert.Equal(t, DelayDecision{true, int64(50 * time.Millisecond)}, equal.NextDelay(ctxAt(1, 0)))
+	assert.Equal(t, DelayDecision{true, int64(125 * time.Millisecond)}, equal.NextDelay(ctxAt(2, 0)))
+	assert.Equal(t, DelayDecision{true, int64(300 * time.Millisecond)}, equal.NextDelay(ctxAt(3, 0)))
+	assert.Equal(t, DelayDecision{true, int64(400*time.Millisecond) - 1}, equal.NextDelay(ctxAt(4, 0)))
 }

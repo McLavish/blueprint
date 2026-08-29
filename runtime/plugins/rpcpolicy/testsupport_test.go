@@ -60,6 +60,84 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
+// DeadlineNS is the inverse of Now: a deadline minted on this clock's timeline
+// converts back to the exact ns NowNS would report at that instant.
+func (c *fakeClock) DeadlineNS(deadline time.Time) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return int64(deadline.Sub(c.base))
+}
+
+// WithTimeout mints the deadline on the VIRTUAL clock, so the boundary the
+// engine reads back off the context is the same integer the test advanced to.
+// The real timer underneath is only a backstop; the tests never wait for it.
+func (c *fakeClock) WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithDeadline(ctx, c.Now().Add(d))
+}
+
+// tickClock advances virtual time by one tick on EVERY observation, so the two
+// clock samples a "NowNS() + (deadline - Now())" conversion mixes can no longer
+// agree, and an attempt boundary derived from anything other than the context
+// the invoker received lands on a different instant. Freeze stops the ticking
+// so a test can place the finish exactly.
+type tickClock struct {
+	mu     sync.Mutex
+	base   time.Time
+	ns     int64
+	tick   time.Duration
+	frozen bool
+}
+
+func newTickClock(tick time.Duration) *tickClock {
+	return &tickClock{base: time.Now(), tick: tick}
+}
+
+func (c *tickClock) observe() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ns := c.ns
+	if !c.frozen {
+		c.ns += int64(c.tick)
+	}
+	return ns
+}
+
+func (c *tickClock) NowNS() int64 { return c.observe() }
+
+func (c *tickClock) Now() time.Time { return c.base.Add(time.Duration(c.observe())) }
+
+func (c *tickClock) DeadlineNS(deadline time.Time) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return int64(deadline.Sub(c.base))
+}
+
+func (c *tickClock) WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithDeadline(ctx, c.Now().Add(d))
+}
+
+func (c *tickClock) Sleep(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.ns += int64(d)
+	c.mu.Unlock()
+	return ctx.Err()
+}
+
+// FreezeAt pins virtual time at ns and stops the per-observation tick, so every
+// later observation reports exactly ns.
+func (c *tickClock) FreezeAt(ns int64) {
+	c.mu.Lock()
+	c.ns = ns
+	c.frozen = true
+	c.mu.Unlock()
+}
+
+// Deadline mints an absolute deadline d from now on this clock's timeline.
+func (c *tickClock) Deadline(d time.Duration) time.Time { return c.Now().Add(d) }
+
 // Sleep advances virtual time instantly; a context that is already done still
 // wins, which is how an inbound cancel reaches the backoff.
 func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
@@ -178,9 +256,13 @@ func newTestStateWithFaults(t *testing.T, doc string, schedule *FaultSchedule, e
 
 func newTestStateIn(t *testing.T, dir, service, doc string, schedule *FaultSchedule, epochMs int64, roll func() float64) *testState {
 	t.Helper()
+	return newTestStateOn(t, newRealClock(), dir, service, doc, schedule, epochMs, roll)
+}
+
+func newTestStateOn(t *testing.T, clock Clock, dir, service, doc string, schedule *FaultSchedule, epochMs int64, roll func() float64) *testState {
+	t.Helper()
 	cfg, err := ParseConfig([]byte(doc), "test.yaml")
 	require.NoError(t, err)
-	clock := newRealClock()
 	reg, err := buildRegistry(cfg, sha256Hex([]byte(doc)), nil, clock)
 	require.NoError(t, err)
 	l := newTestLogIn(t, dir, service)

@@ -2,6 +2,7 @@ package rpcpolicy
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,13 +25,27 @@ const (
 	outcomeDeadlineAtSubmit  = "deadline_at_submit"
 	outcomeDeadlineAtDequeue = "deadline_at_dequeue"
 	outcomeDeadlineAtFinish  = "deadline_at_finish"
+	outcomeCancelledInQueue  = "cancelled_in_queue"
 )
 
 // unboundedQueue is the sentinel for `queue_capacity: null`.
 const unboundedQueue = -1
 
+// waiterState is the single-winner handshake between releaseWorker handing a
+// permit to the head of the queue and a caller cancelling out of it. Both
+// transitions happen under station.mu, so exactly one of them takes effect.
+type waiterState int
+
+const (
+	waiterQueued waiterState = iota
+	waiterHandedOff
+	waiterCancelled
+)
+
 type waiter struct {
 	ready chan struct{}
+	// state, queueDepth and workersBusy are all guarded by station.mu.
+	state waiterState
 	// Sampled at the instant the permit is handed over, so the record reports
 	// the state this request actually observed.
 	queueDepth  int
@@ -109,9 +124,12 @@ type admission struct {
 // the queue-full test, and a free worker is taken BEFORE it too -- so
 // queue_full can only be reported when every worker is busy, exactly as msim.
 //
-// A queued request is NOT removed when its caller goes away: msim keeps it in
-// the queue until a worker frees up and reports deadline_at_dequeue there, and
-// the c+K occupancy the model fits depends on that.
+// A queued request whose DEADLINE passes is NOT removed: msim keeps it in the
+// queue until a worker frees up and reports deadline_at_dequeue there, and the
+// c+K occupancy the model fits depends on that. A queued request whose caller
+// CANCELS is a different drop point (msim's cancel_queued, service.py:305): it
+// is tombstoned immediately, gives its slot back at once, takes no worker, and
+// is reported cancelled_in_queue.
 func (s *station) Acquire(ctx context.Context) admission {
 	start := s.clock.Now()
 	if expired(ctx, start) {
@@ -137,7 +155,35 @@ func (s *station) Acquire(ctx context.Context) admission {
 	s.waiters = append(s.waiters, w)
 	s.mu.Unlock()
 
-	<-w.ready
+	select {
+	case <-w.ready:
+	case <-ctx.Done():
+		// Only an explicit cancel tombstones the waiter. An expired DEADLINE
+		// keeps its slot and is reported at dequeue, which is what makes the
+		// occupancy c + K rather than "whatever survived the deadline".
+		if errors.Is(ctx.Err(), context.Canceled) {
+			s.mu.Lock()
+			if w.state == waiterQueued {
+				w.state = waiterCancelled
+				s.removeWaiterLocked(w)
+				// Depth AFTER the slot is returned, as in msim's cancel_queued:
+				// the tombstone is discounted at cancel time, not when it
+				// reaches the head of the queue.
+				depth, busy := len(s.waiters), s.busy
+				s.mu.Unlock()
+				return admission{
+					outcome:     outcomeCancelledInQueue,
+					wait:        s.clock.Now().Sub(start),
+					queueDepth:  depth,
+					workersBusy: busy,
+				}
+			}
+			// The permit was already handed over: releaseWorker won the race, so
+			// take the permit path and release it properly below.
+			s.mu.Unlock()
+		}
+		<-w.ready
+	}
 	wait := s.clock.Now().Sub(start)
 	p := &permit{st: s}
 	if expired(ctx, s.clock.Now()) {
@@ -152,17 +198,31 @@ func (s *station) Acquire(ctx context.Context) admission {
 // occupancy bound exactly c in service plus K queued.
 func (s *station) releaseWorker() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.waiters) > 0 {
 		w := s.waiters[0]
 		s.waiters = s.waiters[1:]
+		w.state = waiterHandedOff
 		w.queueDepth = len(s.waiters)
 		w.workersBusy = s.busy - 1
-		s.mu.Unlock()
+		// Closed while still holding the mutex, so a cancel arriving at the same
+		// instant either sees waiterQueued (and wins, before the hand-off) or
+		// sees waiterHandedOff with the channel already closed. close never
+		// blocks, so nothing waits on the lock for it.
 		close(w.ready)
 		return
 	}
 	s.busy--
-	s.mu.Unlock()
+}
+
+// removeWaiterLocked drops a cancelled waiter out of the FIFO. Callers hold mu.
+func (s *station) removeWaiterLocked(w *waiter) {
+	for i, x := range s.waiters {
+		if x == w {
+			s.waiters = append(s.waiters[:i], s.waiters[i+1:]...)
+			return
+		}
+	}
 }
 
 // Busy reports the workers currently held (tests assert the c+K bound).

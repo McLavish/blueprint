@@ -1,12 +1,21 @@
 package rpcpolicy
 
 import (
+	"math"
 	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// requireTokens compares the bucket by VALUE. big.Int's zero has no unique
+// representation, so the bucket is never compared structurally.
+func requireTokens(t *testing.T, p *RetryBudgetPolicy, want *big.Int) {
+	t.Helper()
+	got := p.Tokens()
+	require.Zerof(t, got.Cmp(want), "tokens: got %s, want %s", got, want)
+}
 
 func mustBudget(t *testing.T, ratio float64, maxRetries int, underlying Policy) *RetryBudgetPolicy {
 	t.Helper()
@@ -127,7 +136,7 @@ func TestRetryBudgetRefundIsCappedAtTheCeiling(t *testing.T) {
 	p := mustBudget(t, 0.1, 1, mustFixed(t, 10, 0))
 	before := p.Tokens()
 	p.Rollback(ctxAt(1, 0)) // nothing was charged; the cap must hold
-	assert.Equal(t, before, p.Tokens())
+	requireTokens(t, p, before)
 }
 
 // limitDenominator is a port of CPython's Fraction.limit_denominator; these are
@@ -157,4 +166,41 @@ func TestLimitDenominatorMatchesCPython(t *testing.T) {
 	// Negative inputs keep their sign (never produced by a validated ratio, but
 	// the port must still be the same function).
 	assert.Equal(t, "-1/3", limitDenominator(new(big.Rat).SetFloat64(-1.0/3.0), bound).RatString())
+}
+
+// max_retries at the top of the int range: retryCost x max_retries has no int64,
+// and an int64 bucket wrapped the CEILING negative -- turning the most generous
+// budget expressible into one that never allowed a single retry. The bucket is
+// big.Int, exactly as msim's Python integers are.
+func TestRetryBudgetHandlesMaxSizedMaxRetries(t *testing.T) {
+	p := mustBudget(t, 1e-5, math.MaxInt, mustFixed(t, 100, 7))
+	require.Equal(t, int64(100_000), p.RetryCost())
+	require.Equal(t, int64(1), p.Deposit())
+
+	full := new(big.Int).Mul(big.NewInt(100_000), big.NewInt(int64(math.MaxInt)))
+	assert.Positive(t, p.MaxTokens().Sign(), "the ceiling must not wrap negative")
+	assert.Zero(t, p.MaxTokens().Cmp(full))
+	requireTokens(t, p, full)
+	assert.True(t, p.CanRetry(), "a full bucket is not an empty one")
+	assert.InEpsilon(t, float64(math.MaxInt)*100.0, p.TokenBalance(), 1e-12)
+
+	// withdraw
+	require.Equal(t, DelayDecision{true, 7}, p.NextDelay(ctxAt(1, 0)))
+	requireTokens(t, p, new(big.Int).Sub(full, big.NewInt(100_000)))
+
+	// refund, then two more that must clamp rather than mint
+	p.Rollback(ctxAt(1, 0))
+	requireTokens(t, p, full)
+	p.Rollback(ctxAt(1, 0))
+	requireTokens(t, p, full)
+
+	// deposit at the ceiling is a no-op
+	p.OnRequestStart(0)
+	requireTokens(t, p, full)
+
+	// and the bucket still moves at the bottom of its range
+	for i := 0; i < 3; i++ {
+		require.Equal(t, DelayDecision{true, 7}, p.NextDelay(ctxAt(1, 0)))
+	}
+	requireTokens(t, p, new(big.Int).Sub(full, big.NewInt(300_000)))
 }

@@ -379,3 +379,205 @@ func TestServeReleasePermitFreesTheWorkerMidHandler(t *testing.T) {
 	assert.Equal(t, 0, st.Busy(), "the permit was handed back before the downstream call")
 	close(finish)
 }
+
+// --- cancellation while queued (CONTRACTS.md §5) ---------------------------
+
+// msim's cancel_queued (service.py:305): a queued attempt whose CALLER cancels
+// is tombstoned at once. It never takes a worker, and it discounts its queue
+// slot at cancel time rather than when its tombstone reaches the head -- so the
+// very next arrival is QUEUED, not shed.
+func TestStationCancelWhileQueuedFreesItsSlotImmediately(t *testing.T) {
+	st := newTestStation(1, intPtr(1), false)
+	held := st.Acquire(context.Background())
+	require.Equal(t, outcomeAdmitted, held.outcome)
+
+	ctx, cancel := context.WithCancel(context.Background()) // deliberately no deadline
+	got := make(chan admission, 1)
+	go func() { got <- st.Acquire(ctx) }()
+	waitFor(t, func() bool { return st.QueueDepth() == 1 })
+
+	cancel()
+	select {
+	case adm := <-got:
+		assert.Equal(t, outcomeCancelledInQueue, adm.outcome)
+		assert.Nil(t, adm.permit, "a cancelled waiter never takes a worker")
+		assert.Equal(t, 0, adm.queueDepth, "the slot is discounted at cancel time")
+		assert.Equal(t, 1, adm.workersBusy)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cancelled waiter must return promptly, not wait for a worker")
+	}
+	assert.Equal(t, 0, st.QueueDepth(), "the queue slot is back")
+	assert.Equal(t, 1, st.Busy(), "the held worker is untouched")
+
+	// Capacity restored: this arrival joins the queue instead of being shed.
+	second := make(chan admission, 1)
+	go func() { second <- st.Acquire(context.Background()) }()
+	waitFor(t, func() bool { return st.QueueDepth() == 1 })
+	held.permit.release()
+	adm := <-second
+	require.Equal(t, outcomeAdmitted, adm.outcome, "the freed slot was reusable")
+	adm.permit.release()
+	waitFor(t, func() bool { return st.Busy() == 0 })
+}
+
+// An expired DEADLINE is the other rule: the waiter keeps its slot and is
+// reported at dequeue, so a cancel and a timeout are not interchangeable.
+func TestStationDeadlineDoesNotFreeTheSlotEarly(t *testing.T) {
+	st := newTestStation(1, intPtr(1), false)
+	held := st.Acquire(context.Background())
+	require.Equal(t, outcomeAdmitted, held.outcome)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	got := make(chan admission, 1)
+	go func() { got <- st.Acquire(ctx) }()
+	waitFor(t, func() bool { return st.QueueDepth() == 1 })
+
+	<-ctx.Done()
+	// Still queued: an expired deadline does not give the slot back, so the
+	// station is still full and the next arrival is shed.
+	assert.Equal(t, 1, st.QueueDepth())
+	assert.Equal(t, outcomeQueueFull, st.Acquire(context.Background()).outcome)
+
+	held.permit.release()
+	adm := <-got
+	assert.Equal(t, outcomeDeadlineAtDequeue, adm.outcome)
+	assert.Nil(t, adm.permit)
+	waitFor(t, func() bool { return st.Busy() == 0 })
+}
+
+// The cancel and the permit hand-off are both taken under the station mutex, so
+// exactly one of them wins however they interleave.
+func TestStationCancelRacingReleaseHasOneWinner(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		st := newTestStation(1, intPtr(1), false)
+		held := st.Acquire(context.Background())
+		require.Equal(t, outcomeAdmitted, held.outcome)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		got := make(chan admission, 1)
+		go func() { got <- st.Acquire(ctx) }()
+		waitFor(t, func() bool { return st.QueueDepth() == 1 })
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; held.permit.release() }()
+		go func() { defer wg.Done(); <-start; cancel() }()
+		close(start)
+		wg.Wait()
+
+		adm := <-got
+		switch adm.outcome {
+		case outcomeCancelledInQueue:
+			require.Nil(t, adm.permit, "iteration %d: a cancelled waiter holds no permit", i)
+		case outcomeAdmitted:
+			require.NotNil(t, adm.permit, "iteration %d: an admitted waiter holds a permit", i)
+			adm.permit.release()
+		default:
+			t.Fatalf("iteration %d: unexpected outcome %q", i, adm.outcome)
+		}
+		waitFor(t, func() bool { return st.Busy() == 0 && st.QueueDepth() == 0 })
+		cancel()
+	}
+}
+
+// A record is written for EVERY server-side outcome, cancelled_in_queue
+// included: response_code Canceled, no handler, no permit.
+func TestServeWritesACancelledInQueueRecord(t *testing.T) {
+	s := newTestState(t, "default_policy: a\nprofiles:\n  a:\n    timeout: 1s\nserver:\n  workers: 1\n  queue_capacity: 1\n")
+	st := s.registry.Load().Station()
+
+	inHandler := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_, _ = s.serve(context.Background(), nil, testMethod, func(context.Context, interface{}) (interface{}, error) {
+			close(inHandler)
+			<-release
+			return "ok", nil
+		})
+	}()
+	<-inHandler
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.serve(ctx, nil, testMethod, func(context.Context, interface{}) (interface{}, error) {
+			t.Error("a cancelled waiter must never reach the handler")
+			return nil, nil
+		})
+		done <- err
+	}()
+	waitFor(t, func() bool { return st.QueueDepth() == 1 })
+	cancel()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.Equal(t, codes.Canceled, status.Code(err))
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cancelled waiter did not return")
+	}
+
+	// The freed slot is immediately usable: this submit is queued, not shed.
+	third := make(chan error, 1)
+	go func() {
+		_, err := s.serve(context.Background(), nil, testMethod, func(context.Context, interface{}) (interface{}, error) {
+			return "ok", nil
+		})
+		third <- err
+	}()
+	waitFor(t, func() bool { return st.QueueDepth() == 1 })
+	close(release)
+	require.NoError(t, <-third)
+
+	waitFor(t, func() bool { return len(s.tlog.ofKind("server")) == 3 })
+	var cancelled map[string]interface{}
+	for _, r := range s.tlog.ofKind("server") {
+		assert.NotEqual(t, outcomeQueueFull, r["admission_outcome"], "the freed slot was reusable")
+		if r["admission_outcome"] == outcomeCancelledInQueue {
+			cancelled = r
+		}
+	}
+	require.NotNil(t, cancelled, "every server-side outcome gets a record")
+	assert.Equal(t, "Canceled", cancelled["response_code"])
+	assert.Equal(t, true, cancelled["is_error"])
+	assert.Equal(t, 0.0, cancelled["handler_ms"])
+	assert.Equal(t, 0.0, cancelled["permit_released_at"], "no permit was ever held")
+	assert.Equal(t, 0.0, cancelled["admission_queue_depth"])
+}
+
+// The server's strict finish rule is measured against the deadline the CONTEXT
+// carries, converted against ONE clock base. Mixing two samples of a moving
+// clock cut the request a tick early.
+func TestServeClassifiesAgainstTheContextDeadline(t *testing.T) {
+	const doc = "default_policy: a\nprofiles:\n  a:\n    timeout: 1s\n"
+
+	run := func(offset int64) *testState {
+		clock := newTickClock(time.Millisecond)
+		s := newTestStateOn(t, clock, t.TempDir(), "svc-test", doc, nil, 0, nil)
+		// An hour out, so only the strict finish rule can ever fire.
+		ctx, cancel := context.WithDeadline(context.Background(), clock.Deadline(time.Hour))
+		defer cancel()
+		d, ok := ctx.Deadline()
+		require.True(t, ok)
+		deadline := clock.DeadlineNS(d)
+		_, _ = s.serve(ctx, nil, testMethod, func(context.Context, interface{}) (interface{}, error) {
+			clock.FreezeAt(deadline + offset)
+			return "ok", nil
+		})
+		return s
+	}
+
+	recs := run(-1).tlog.ofKind("server")
+	require.Len(t, recs, 1)
+	assert.Equal(t, outcomeAdmitted, recs[0]["admission_outcome"],
+		"one ns before the context's own deadline is still a success")
+	assert.Equal(t, "OK", recs[0]["response_code"])
+
+	recs = run(0).tlog.ofKind("server")
+	require.Len(t, recs, 1)
+	assert.Equal(t, outcomeDeadlineAtFinish, recs[0]["admission_outcome"],
+		"finishing AT the context's own deadline is a drop")
+	assert.Equal(t, "DeadlineExceeded", recs[0]["response_code"])
+}

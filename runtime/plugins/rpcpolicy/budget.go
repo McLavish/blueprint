@@ -30,10 +30,17 @@ type RetryBudgetPolicy struct {
 	// ratio: one retry costs `retryCost` tokens, each request deposits
 	// `deposit`. Exact arithmetic -- no float drift; limitDenominator recovers
 	// intended ratios like 1/3 from their float representations.
+	//
+	// retryCost and deposit are bounded by maxRatioDenominator and validated to
+	// fit an int64. The BUCKET is not: max_retries is a caller-supplied int, so
+	// `retryCost * max_retries` and every deposit and refund against it are
+	// big.Int, exactly as msim's Python integers are. An int64 bucket silently
+	// wrapped to a negative ceiling at large max_retries, which turned the
+	// budget from "generous" into "always empty".
 	retryCost int64
 	deposit   int64
-	maxTokens int64
-	tokens    int64
+	maxTokens *big.Int
+	tokens    *big.Int
 }
 
 // maxRatioDenominator is msim's _MAX_RATIO_DENOMINATOR. Wide enough that every
@@ -71,33 +78,50 @@ func NewRetryBudgetPolicy(budgetRatio float64, maxRetries int, underlying Policy
 		retryCost:   ratio.Denom().Int64(),
 		deposit:     ratio.Num().Int64(),
 	}
-	p.maxTokens = p.retryCost * int64(maxRetries)
-	p.tokens = p.maxTokens // start with full budget
+	p.maxTokens = new(big.Int).Mul(big.NewInt(p.retryCost), big.NewInt(int64(maxRetries)))
+	p.tokens = new(big.Int).Set(p.maxTokens) // start with full budget
 	p.underlying = underlying
 	p.throttleAllow = func(int64) bool { return p.CanRetry() }
-	p.charge = func() { p.tokens -= p.retryCost }
+	p.charge = func() { p.tokens.Sub(p.tokens, big.NewInt(p.retryCost)) }
 	// Capped balance: a refund after an intervening deposit clamps at the cap
 	// and mints quota. Only the immediate (deadline-veto) refund is exact.
-	p.refund = func() { p.tokens = minInt64(p.maxTokens, p.tokens+p.retryCost) }
+	p.refund = func() { p.credit(p.retryCost) }
 	return p, nil
+}
+
+// credit adds n tokens and clamps at the ceiling.
+func (p *RetryBudgetPolicy) credit(n int64) {
+	p.tokens.Add(p.tokens, big.NewInt(n))
+	if p.tokens.Cmp(p.maxTokens) > 0 {
+		p.tokens.Set(p.maxTokens)
+	}
 }
 
 // OnRequestStart implements Policy: one deposit per admitted request,
 // regardless of how it turns out.
-func (p *RetryBudgetPolicy) OnRequestStart(int64) {
-	p.tokens = minInt64(p.maxTokens, p.tokens+p.deposit)
-}
+func (p *RetryBudgetPolicy) OnRequestStart(int64) { p.credit(p.deposit) }
 
 // CanRetry reports whether the bucket holds a whole retry.
-func (p *RetryBudgetPolicy) CanRetry() bool { return p.tokens >= p.retryCost }
-
-// TokenBalance is msim's get_token_balance: 100 tokens == one retry.
-func (p *RetryBudgetPolicy) TokenBalance() float64 {
-	return float64(p.tokens) / float64(p.retryCost) * 100.0
+func (p *RetryBudgetPolicy) CanRetry() bool {
+	return p.tokens.Cmp(big.NewInt(p.retryCost)) >= 0
 }
 
-// Tokens exposes the raw integer bucket (tests assert on it, as msim's do).
-func (p *RetryBudgetPolicy) Tokens() int64 { return p.tokens }
+// TokenBalance is msim's get_token_balance: 100 tokens == one retry. Computed
+// as an exact rational and only then rounded, so a bucket far beyond float64's
+// integer range still reports the right ratio.
+func (p *RetryBudgetPolicy) TokenBalance() float64 {
+	r := new(big.Rat).SetFrac(new(big.Int).Set(p.tokens), big.NewInt(p.retryCost))
+	r.Mul(r, big.NewRat(100, 1))
+	f, _ := r.Float64()
+	return f
+}
+
+// Tokens exposes a copy of the raw integer bucket (tests assert on it, as
+// msim's do).
+func (p *RetryBudgetPolicy) Tokens() *big.Int { return new(big.Int).Set(p.tokens) }
+
+// MaxTokens exposes a copy of the bucket ceiling, retryCost x max_retries.
+func (p *RetryBudgetPolicy) MaxTokens() *big.Int { return new(big.Int).Set(p.maxTokens) }
 
 // Deposit exposes the per-request deposit in bucket units.
 func (p *RetryBudgetPolicy) Deposit() int64 { return p.deposit }
@@ -155,11 +179,4 @@ func limitDenominator(x *big.Rat, maxDen *big.Int) *big.Rat {
 		out.Neg(out)
 	}
 	return out
-}
-
-func minInt64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
 }
