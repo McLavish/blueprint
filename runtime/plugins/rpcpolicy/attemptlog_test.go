@@ -25,7 +25,7 @@ var (
 		"start_epoch", "end_epoch", "duration_ms", "is_error", "response_code",
 	}
 	clientKeys = append(append([]string{}, baseKeys...),
-		"route", "profile", "attempt", "retry_delay_ms", "gate", "drop_reason", "retry_denied")
+		"route", "profile", "attempt", "peer", "retry_delay_ms", "gate", "drop_reason", "retry_denied")
 	serverKeys = append(append([]string{}, baseKeys...),
 		"admission_outcome", "admission_wait_ms", "admission_queue_depth", "admission_workers_busy",
 		"injected_ms", "handler_ms", "permit_released_at", "fault_hit")
@@ -45,7 +45,7 @@ func assertKeySet(t *testing.T, want []string, rec map[string]interface{}) {
 func TestClientRecordKeySet(t *testing.T) {
 	e, clock, log := newTestEngine(t)
 	prof := testProfile(t, "default_policy: a\nprofiles:\n  a:\n    timeout: 50ms\n")
-	err := e.execute(context.Background(), prof, "root", testMethod, func(context.Context) error {
+	err := e.execute(context.Background(), prof, "root", testMethod, testPeer, func(context.Context) error {
 		clock.Advance(time.Millisecond)
 		return status.Error(codes.Unavailable, "boom")
 	})
@@ -63,6 +63,7 @@ func TestClientRecordKeySet(t *testing.T) {
 	assert.Equal(t, "Unavailable", recs[0]["response_code"])
 	assert.Equal(t, true, recs[0]["is_error"])
 	assert.InDelta(t, 1.0, recs[0]["duration_ms"], 0.001)
+	assert.Equal(t, testPeer, recs[0]["peer"], "the dial target of the connection the attempt went out on")
 }
 
 func TestServerRecordKeySet(t *testing.T) {

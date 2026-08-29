@@ -151,6 +151,15 @@ func TestEndToEndThreeTiersUnderAPermanentFault(t *testing.T) {
 		"x-rpcpolicy-route survives both hops")
 	leaf.mu.Unlock()
 
+	// Every client record names the connection it went out on, so the pipeline
+	// can resolve caller -> callee without a service registry.
+	for i, r := range edgeClients {
+		assert.Equal(t, relayAddr, r["peer"], "edge record %d dialed the relay", i)
+	}
+	for i, r := range relayClients {
+		assert.Equal(t, leafAddr, r["peer"], "relay record %d dialed the leaf", i)
+	}
+
 	// The last attempt of each client says why it stopped.
 	assert.Equal(t, deniedExhausted, edgeClients[1]["retry_denied"])
 	assert.Equal(t, "", edgeClients[0]["retry_denied"])
@@ -275,6 +284,18 @@ func TestEndToEndSucceedsWithoutAFault(t *testing.T) {
 	roots := edgeState.tlog.ofKind("root")
 	require.Len(t, roots, 1)
 	assert.Equal(t, float64(200), roots[0]["http_status"])
+}
+
+// `peer` is the dial address as written, with the scheme grpc may prepend
+// stripped back off (CONTRACTS.md §5).
+func TestPeerOfIsTheDialTargetWithoutItsScheme(t *testing.T) {
+	for _, target := range []string{"svc_a_container:12345", "dns:///svc_a_container:12345", "passthrough:///svc_a_container:12345"} {
+		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		require.NoError(t, err)
+		assert.Equal(t, "svc_a_container:12345", peerOf(conn), "target %q", target)
+		_ = conn.Close()
+	}
+	assert.Equal(t, "", peerOf(nil))
 }
 
 // The public API of CONTRACTS.md §6 is inert without RPCPOLICY_CONFIG and

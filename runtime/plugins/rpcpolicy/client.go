@@ -2,6 +2,7 @@ package rpcpolicy
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -48,8 +49,28 @@ func (s *runtimeState) unaryClientInterceptor() grpc.UnaryClientInterceptor {
 		if prof == nil {
 			return invoker(ctx, method, req, reply, cc, opts...)
 		}
-		return s.engine.execute(ctx, prof, tc.route, method, func(attemptCtx context.Context) error {
+		return s.engine.execute(ctx, prof, tc.route, method, peerOf(cc), func(attemptCtx context.Context) error {
 			return invoker(attemptCtx, method, req, reply, cc, opts...)
 		})
 	}
+}
+
+// peerOf is the `peer` field of a client record (CONTRACTS.md §5): the dial
+// target of the connection the attempt goes out on, AS CONFIGURED
+// (`svc_a_container:12345`), because the pipeline maps its host through
+// placement.yaml to the callee service. grpc keeps the string handed to
+// NewClient, but a caller (or a future grpc) may have spelled a default scheme
+// into it, so the two schemes Blueprint's generated clients can produce are
+// stripped back off.
+func peerOf(cc *grpc.ClientConn) string {
+	if cc == nil {
+		return ""
+	}
+	target := cc.Target()
+	for _, scheme := range []string{"dns:///", "passthrough:///"} {
+		if rest, ok := strings.CutPrefix(target, scheme); ok {
+			return rest
+		}
+	}
+	return target
 }
