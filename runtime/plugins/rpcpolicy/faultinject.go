@@ -82,9 +82,54 @@ func (s *FaultSchedule) validate() error {
 		case rule.AddLatencyMS < 0:
 			return fmt.Errorf("faultinject: rule %d: add_latency_ms %v is negative", i, rule.AddLatencyMS)
 		}
+		// A finite-but-astronomical bound still has no time.Duration: the
+		// float64 -> int64 conversion of an out-of-range value is undefined in
+		// Go, so the window would get an arbitrary anchor. Reject it here
+		// instead, where the file name is still in hand.
+		for _, field := range []struct {
+			name string
+			ok   bool
+		}{
+			{"start_s", secondsFits(rule.StartS)},
+			{"end_s", secondsFits(rule.EndS)},
+			{"add_latency_ms", millisFits(rule.AddLatencyMS)},
+		} {
+			if !field.ok {
+				return fmt.Errorf("faultinject: rule %d: %s does not fit a time.Duration", i, field.name)
+			}
+		}
 	}
 	return nil
 }
+
+// maxDurationNS is 2^63 as a float64: the first value a time.Duration cannot
+// hold. float64(math.MaxInt64) rounds UP to exactly this, so it is also the
+// only correct bound to compare a rounded float against.
+const maxDurationNS = 9223372036854775808.0
+
+// roundToDuration is msim's core.s_to_ns / ms_to_ns: int(round(value * unit)).
+// Python's round() breaks ties to EVEN, which math.RoundToEven reproduces and
+// math.Round (ties away from zero) does not -- they disagree on exactly the
+// half-nanosecond inputs a hand-written schedule is most likely to contain.
+func roundToDuration(value, unit float64) (time.Duration, bool) {
+	ns := math.RoundToEven(value * unit)
+	if math.IsNaN(ns) || ns >= maxDurationNS || ns < -maxDurationNS {
+		return 0, false
+	}
+	return time.Duration(ns), true
+}
+
+func secondsToDuration(s float64) (time.Duration, bool) {
+	return roundToDuration(s, float64(time.Second))
+}
+
+func millisToDuration(ms float64) (time.Duration, bool) {
+	return roundToDuration(ms, float64(time.Millisecond))
+}
+
+func secondsFits(s float64) bool { _, ok := secondsToDuration(s); return ok }
+
+func millisFits(ms float64) bool { _, ok := millisToDuration(ms); return ok }
 
 // faultInjector answers "what is being injected right now" for a method.
 // now and roll are seams for tests; nil means time.Now and a private,
@@ -127,6 +172,25 @@ func (f *faultInjector) active(method string) (float64, float64) {
 	return activeFault(f.schedule, f.epochMs, f.now(), method)
 }
 
+// activeLatency is the additive latency for a method at the current instant.
+// It is read ONCE, at admission, because that latency is what occupies the
+// permit.
+func (f *faultInjector) activeLatency(method string) float64 {
+	latency, _ := f.active(method)
+	return latency
+}
+
+// activePFail is the active p_fail for a method at the current instant: the max
+// over the live windows, re-read immediately before the roll. msim's
+// _finish_service evaluates _fails_now(now) at the COMPLETION instant
+// (service.py:435 -> :216), so a handler that runs into or out of a short
+// window is governed by the probability in force when it finishes, not by the
+// one in force when it started.
+func (f *faultInjector) activePFail(method string) float64 {
+	_, pFail := f.active(method)
+	return pFail
+}
+
 // activeFault composes the rules that name `method` and are live at `now`.
 func activeFault(schedule *FaultSchedule, epochMs int64, now time.Time, method string) (float64, float64) {
 	if schedule == nil {
@@ -145,8 +209,14 @@ func activeFault(schedule *FaultSchedule, epochMs int64, now time.Time, method s
 		if rule.Method != method {
 			continue
 		}
-		start := time.Duration(math.Round(rule.StartS * float64(time.Second)))
-		end := time.Duration(math.Round(rule.EndS * float64(time.Second)))
+		start, startOK := secondsToDuration(rule.StartS)
+		end, endOK := secondsToDuration(rule.EndS)
+		if !startOK || !endOK {
+			// LoadFaults rejects these; a schedule built in code cannot be
+			// trusted to have gone through it, and an unrepresentable window is
+			// better skipped than anchored arbitrarily.
+			continue
+		}
 		// The window is half-open, [start_s, end_s), and the Python pipeline
 		// depends on it: it selects in-window records with lo <= start_epoch < hi.
 		if elapsed < start || elapsed >= end {

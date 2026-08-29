@@ -2,6 +2,7 @@ package rpcpolicy
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"google.golang.org/grpc"
@@ -66,8 +67,13 @@ func (s *runtimeState) serve(ctx context.Context, req interface{}, fullMethod st
 
 	if adm.outcome != outcomeAdmitted {
 		code := codes.DeadlineExceeded
-		if adm.outcome == outcomeQueueFull {
+		switch adm.outcome {
+		case outcomeQueueFull:
 			code = codes.ResourceExhausted
+		case outcomeCancelledInQueue:
+			// The caller walked away while queued: Canceled, not a deadline --
+			// msim's DropReason.CANCELLED (CONTRACTS.md §5).
+			code = codes.Canceled
 		}
 		err := status.Errorf(code, "rpcpolicy: %s: %s", fullMethod, adm.outcome)
 		s.finishServerRecord(rec, startWall, code, 0)
@@ -80,12 +86,23 @@ func (s *runtimeState) serve(ctx context.Context, req interface{}, fullMethod st
 	// D14: inside the permit, in this order -- injected latency occupies a
 	// worker, the handler occupies a worker, and the failure roll happens after
 	// the service time rather than before it.
-	addLatencyMS, pFail := s.faults.active(fullMethod)
+	//
+	// The two halves of a fault are read at two different instants on purpose.
+	// The additive latency is what OCCUPIES the permit, so it is fixed at
+	// admission; the failure probability is evaluated at the roll instant, which
+	// is where msim's _finish_service calls _fails_now(now).
+	addLatencyMS := s.faults.activeLatency(fullMethod)
 	var resp interface{}
 	var err error
 	injectedStart := s.clock.Now()
 	if addLatencyMS > 0 {
-		if serr := sleepCtx(ctx, time.Duration(addLatencyMS*float64(time.Millisecond))); serr != nil {
+		injected, ok := millisToDuration(addLatencyMS)
+		if !ok {
+			// Unrepresentable as a Duration: hold the permit until the deadline
+			// cuts it, which is the only honest reading of "wait ~forever".
+			injected = time.Duration(math.MaxInt64)
+		}
+		if serr := sleepCtx(ctx, injected); serr != nil {
 			rec.InjectedMS = msOf(s.clock.Now().Sub(injectedStart))
 			code := codeOf(serr)
 			if code == codes.DeadlineExceeded {
@@ -106,7 +123,7 @@ func (s *runtimeState) serve(ctx context.Context, req interface{}, fullMethod st
 	resp, err = handler(ctx, req)
 	rec.HandlerMS = msOf(s.clock.Now().Sub(handlerStart))
 
-	if pFail > 0 && s.faults.nextRoll() < pFail {
+	if pFail := s.faults.activePFail(fullMethod); pFail > 0 && s.faults.nextRoll() < pFail {
 		rec.FaultHit = true
 		resp, err = nil, status.Error(codes.Unavailable, "injected fault")
 	}
@@ -130,5 +147,5 @@ func (s *runtimeState) finishServerRecord(rec *ServerRecord, start time.Time, co
 	rec.ResponseCode = code.String()
 	rec.IsError = code != codes.OK
 	rec.PermitReleasedAt = releasedAt
-	s.log.Write(rec)
+	_ = s.log.Write(rec)
 }

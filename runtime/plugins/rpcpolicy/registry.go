@@ -73,15 +73,41 @@ func buildRegistry(cfg *Config, sha string, prev *Registry, clock Clock) (*Regis
 		r.byKey[key] = p
 	}
 
-	switch {
-	case prev != nil && prev.station != nil:
-		// server: is not hot-reloaded.
+	if prev != nil {
+		// `server:` is not hot-reloaded (CONTRACTS.md §2). The previous block
+		// and station are carried across VERBATIM, including their ABSENCE: a
+		// reload that adds a `server:` block to a file that had none must not
+		// conjure an admission station into a running process, any more than a
+		// reload that edits an existing one may resize its queue.
 		r.station = prev.station
 		r.server = prev.server
-	case cfg.Server != nil:
+	} else if cfg.Server != nil {
 		r.station = newStation(cfg.Server, clock)
 	}
 	return r, nil
+}
+
+// serverBlockChanged reports whether a reload's `server:` block differs from the
+// one the process started with. It is ignored either way; the reload event says
+// so rather than leaving the operator to wonder.
+func serverBlockChanged(prev, next *ServerConfig) bool {
+	switch {
+	case prev == nil && next == nil:
+		return false
+	case prev == nil || next == nil:
+		return true
+	case prev.Workers != next.Workers,
+		prev.StripInboundDeadline != next.StripInboundDeadline,
+		prev.HoldPermitThroughFanout != next.HoldPermitThroughFanout:
+		return true
+	}
+	switch {
+	case prev.QueueCapacity == nil && next.QueueCapacity == nil:
+		return false
+	case prev.QueueCapacity == nil || next.QueueCapacity == nil:
+		return true
+	}
+	return *prev.QueueCapacity != *next.QueueCapacity
 }
 
 // profileHash is the identity a reload compares. The struct is re-serialized

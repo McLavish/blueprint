@@ -22,10 +22,23 @@ import (
 // NowNS is monotonic nanoseconds from a base captured at process start: msim's
 // integer time model, which the policy layer needs because every rational
 // (leaky) and integer (budget, fixed window) computation in it is exact.
+//
+// DeadlineNS and WithTimeout exist so that every strict half-open comparison is
+// made against the deadline the callee actually received, in ONE base. Deriving
+// it as `NowNS() + deadline.Sub(Now())` mixed two samples of a clock that moves
+// between them, and deriving an attempt boundary as `NowNS() + timeout` while
+// the attempt context was built from a different clock compared two unrelated
+// timelines outright.
 type Clock interface {
 	Now() time.Time
 	NowNS() int64
+	// DeadlineNS converts an absolute deadline into the same monotonic base
+	// NowNS counts in. It must not observe the clock.
+	DeadlineNS(deadline time.Time) int64
 	Sleep(ctx context.Context, d time.Duration) error
+	// WithTimeout is context.WithTimeout on this clock's timeline, so the
+	// deadline the context carries is convertible by DeadlineNS exactly.
+	WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc)
 }
 
 type realClock struct{ base time.Time }
@@ -35,6 +48,11 @@ func newRealClock() realClock { return realClock{base: time.Now()} }
 func (c realClock) Now() time.Time { return time.Now() }
 
 func (c realClock) NowNS() int64 { return int64(time.Since(c.base)) }
+
+// DeadlineNS implements Clock. base carries a monotonic reading, so a deadline
+// minted by context.WithTimeout (which does too) subtracts monotonically and
+// lands on exactly the scale NowNS reports.
+func (c realClock) DeadlineNS(deadline time.Time) int64 { return int64(deadline.Sub(c.base)) }
 
 func (c realClock) Sleep(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
@@ -50,13 +68,20 @@ func (c realClock) Sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// deadlineNS converts a context deadline into the clock's monotonic ns.
+// WithTimeout implements Clock.
+func (c realClock) WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, d)
+}
+
+// deadlineNS converts a context deadline into the clock's monotonic ns. The
+// value comes from ctx.Deadline() -- the deadline the callee really has -- and
+// never from a second sample of the clock.
 func deadlineNS(c Clock, ctx context.Context) (int64, bool) {
 	d, ok := ctx.Deadline()
 	if !ok {
 		return 0, false
 	}
-	return c.NowNS() + int64(d.Sub(c.Now())), true
+	return c.DeadlineNS(d), true
 }
 
 // profile is a compiled ProfileConfig: the policy chain plus the two timeouts
@@ -222,7 +247,7 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 	ctx := inbound
 	if prof.globalTimeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(inbound, prof.globalTimeout)
+		ctx, cancel = e.clock.WithTimeout(inbound, prof.globalTimeout)
 		defer cancel()
 	}
 	rootDeadline, hasRootDeadline := deadlineNS(e.clock, ctx)
@@ -232,7 +257,7 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 	if !allowPolicyRequest(prof.head, e.clock.NowNS()) {
 		prof.mu.Unlock()
 		now := e.clock.Now()
-		e.log.Write(&ClientRecord{
+		_ = e.log.Write(&ClientRecord{
 			baseRecord: baseRecord{
 				Kind: "client", TraceID: traceID, SpanID: newSpanID(), ParentSpanID: parent.spanID,
 				Service: e.service, Operation: operation,
@@ -253,13 +278,14 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 	retryDelay := int64(0)
 	for {
 		spanID := newSpanID()
-		attemptStart := e.clock.NowNS()
-		attemptDeadline := attemptStart + int64(prof.timeout)
-		if hasRootDeadline && rootDeadline < attemptDeadline {
-			attemptDeadline = rootDeadline
-		}
 
-		attemptCtx, cancel := context.WithTimeout(ctx, prof.timeout)
+		// The attempt boundary is read back OFF the context the invoker is
+		// handed, after it exists: context.WithTimeout already takes the min of
+		// the per-attempt timeout and any inherited root deadline, and reading
+		// it back is the only way the comparison below is guaranteed to be the
+		// same instant the invoker will be cut at.
+		attemptCtx, cancel := e.clock.WithTimeout(ctx, prof.timeout)
+		attemptDeadline, hasAttemptDeadline := deadlineNS(e.clock, attemptCtx)
 		outCtx := metadata.AppendToOutgoingContext(attemptCtx,
 			TraceparentKey, formatTraceparent(traceID, spanID),
 			RouteKey, route,
@@ -274,7 +300,7 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 		// Strict half-open deadline: success requires end < deadline. The same
 		// rule runs on the server side, so both books the same attempt the
 		// same way.
-		if code == codes.OK && end >= attemptDeadline {
+		if code == codes.OK && hasAttemptDeadline && end >= attemptDeadline {
 			code = codes.DeadlineExceeded
 			err = status.Errorf(codes.DeadlineExceeded, "rpcpolicy: %s: attempt finished at its deadline", operation)
 		}
@@ -300,7 +326,7 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 			rec.ResponseCode = codes.Canceled.String()
 			rec.IsError = true
 			rec.DropReason = dropCancelled
-			e.log.Write(rec)
+			_ = e.log.Write(rec)
 			if err == nil {
 				err = status.FromContextError(context.Canceled).Err()
 			}
@@ -311,13 +337,13 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 		updatePolicyResults(prof.head, success, end)
 		if success {
 			prof.mu.Unlock()
-			e.log.Write(rec)
+			_ = e.log.Write(rec)
 			return nil
 		}
 		if !prof.retryOn[code] {
 			prof.mu.Unlock()
 			rec.RetryDenied = deniedNotRetryable
-			e.log.Write(rec)
+			_ = e.log.Write(rec)
 			return err
 		}
 		rctx := RetryContext{Attempt: attempt, Now: end}
@@ -337,11 +363,11 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 			} else {
 				rec.RetryDenied = deniedExhausted
 			}
-			e.log.Write(rec)
+			_ = e.log.Write(rec)
 			return err
 		}
 		prof.mu.Unlock()
-		e.log.Write(rec)
+		_ = e.log.Write(rec)
 
 		if serr := e.clock.Sleep(ctx, time.Duration(decision.Delay)); serr != nil {
 			// The root gave up during the backoff. msim refunds through the

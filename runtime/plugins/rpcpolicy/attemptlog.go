@@ -3,6 +3,7 @@ package rpcpolicy
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -77,12 +78,18 @@ type RootRecord struct {
 
 // EventRecord marks a policy reload (F9). It shares no fields with the three
 // span-shaped records beyond `kind` and `service`.
+//
+// Note is optional and omitted when empty, so the key set of CONTRACTS.md §5 is
+// unchanged for every event that has nothing extra to say. It carries the
+// reason a reload failed, and the fact that a `server:` block differed and was
+// therefore ignored.
 type EventRecord struct {
 	Kind    string  `json:"kind"`
 	Name    string  `json:"name"`
 	Epoch   float64 `json:"epoch"`
 	SHA256  string  `json:"sha256"`
 	Service string  `json:"service"`
+	Note    string  `json:"note,omitempty"`
 }
 
 // Reload event names.
@@ -94,14 +101,22 @@ const (
 // attemptLog is the buffered JSONL writer. Records are marshalled under the
 // lock so the byte stream is line-atomic even with a hundred goroutines.
 type attemptLog struct {
-	mu   sync.Mutex
-	f    *os.File
-	w    *bufio.Writer
-	enc  *json.Encoder
-	stop chan struct{}
-	once sync.Once
-	path string
+	mu     sync.Mutex
+	f      *os.File
+	w      *bufio.Writer
+	enc    *json.Encoder
+	closed bool
+	stop   chan struct{}
+	once   sync.Once
+	// flusher joins the ticker goroutine before Close touches the writer.
+	flusher sync.WaitGroup
+	path    string
 }
+
+// ErrLogClosed is returned by Write and Flush after Close. Accepting a write
+// into a closed log and reporting success loses the record silently, which is
+// exactly the failure the attempt log exists to make impossible.
+var ErrLogClosed = errors.New("rpcpolicy: attempt log is closed")
 
 // newAttemptLog opens $dir/<service>-<startUnixMs>.jsonl and starts the flush
 // ticker.
@@ -123,53 +138,70 @@ func newAttemptLog(dir, service string, startUnixMs int64) (*attemptLog, error) 
 	w := bufio.NewWriterSize(f, logBufferSize)
 	enc := json.NewEncoder(w)
 	l := &attemptLog{f: f, w: w, enc: enc, stop: make(chan struct{}), path: path}
+	l.flusher.Add(1)
 	go l.flushLoop()
 	return l, nil
 }
 
 func (l *attemptLog) flushLoop() {
+	defer l.flusher.Done()
 	t := time.NewTicker(logFlushInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-t.C:
-			l.Flush()
+			_ = l.Flush()
 		case <-l.stop:
 			return
 		}
 	}
 }
 
-// Write appends one record. A write error is deliberately swallowed: losing a
-// record must not fail the RPC the record describes.
-func (l *attemptLog) Write(rec interface{}) {
+// Write appends one record. The RPC path ignores the error on purpose -- losing
+// a record must not fail the RPC the record describes -- but it is REPORTED, so
+// a write after Close cannot pass for a write that landed.
+func (l *attemptLog) Write(rec interface{}) error {
 	if l == nil {
-		return
+		return nil
 	}
 	l.mu.Lock()
-	_ = l.enc.Encode(rec) // json.Encoder appends the newline
-	l.mu.Unlock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return ErrLogClosed
+	}
+	return l.enc.Encode(rec) // json.Encoder appends the newline
 }
 
 // Flush pushes the buffer to the file.
-func (l *attemptLog) Flush() {
+func (l *attemptLog) Flush() error {
 	if l == nil {
-		return
+		return nil
 	}
 	l.mu.Lock()
-	_ = l.w.Flush()
-	l.mu.Unlock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return ErrLogClosed
+	}
+	return l.w.Flush()
 }
 
-// Close stops the ticker and flushes.
+// Close stops the ticker, JOINS it, and flushes. Idempotent.
 func (l *attemptLog) Close() error {
 	if l == nil {
 		return nil
 	}
 	l.once.Do(func() { close(l.stop) })
+	// Join before taking the lock: the ticker may be inside Flush right now, and
+	// closing the file underneath it would race the buffered writer.
+	l.flusher.Wait()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return nil
+	}
+	l.closed = true
 	if err := l.w.Flush(); err != nil {
+		_ = l.f.Close()
 		return err
 	}
 	return l.f.Close()

@@ -197,17 +197,23 @@ func TestEndToEndThreeTiersUnderAPermanentFault(t *testing.T) {
 	for _, r := range edgeClients {
 		assert.Equal(t, root["span_id"], r["parent_span_id"])
 	}
-	edgeSpans := spanIDs(edgeClients)
-	for _, r := range relayServers {
-		assert.Contains(t, edgeSpans, r["parent_span_id"], "a server record's parent is its caller's client record")
-	}
+	// One-to-one per hop AND per attempt, not merely "some client span": the
+	// mapping is asserted as MULTISET equality, so a retry whose server record
+	// pointed at the wrong attempt's span -- or two server records sharing one
+	// parent -- fails here. Set membership would accept both.
+	assert.ElementsMatch(t, spanIDs(edgeClients), parentSpanIDs(relayServers),
+		"every edge attempt has exactly one relay server record, and vice versa")
+	assert.ElementsMatch(t, spanIDs(relayClients), parentSpanIDs(leafServers),
+		"every relay attempt has exactly one leaf server record, and vice versa")
+	// The relay's own client attempts hang off the server record that issued
+	// them: 2 relay server records x 2 attempts each.
 	relayServerSpans := spanIDs(relayServers)
 	for _, r := range relayClients {
 		assert.Contains(t, relayServerSpans, r["parent_span_id"])
 	}
-	relayClientSpans := spanIDs(relayClients)
-	for _, r := range leafServers {
-		assert.Contains(t, relayClientSpans, r["parent_span_id"])
+	for _, span := range relayServerSpans {
+		assert.Equal(t, 2, countParent(relayClients, span),
+			"each relay server record fathered exactly its own two attempts")
 	}
 	// 1 root + 2 edge client + 2 relay server + 4 relay client + 4 leaf server
 	assert.Len(t, uniqueSpans(append(append(append(append(edgeClients, relayServers...), relayClients...), leafServers...), root)), 13,
@@ -349,6 +355,25 @@ func TestRouteForUsesTheRoutesMapThenTheLowercasedPath(t *testing.T) {
 	assert.Equal(t, "hotels", reg.RouteFor("/SearchHandler"))
 	assert.Equal(t, "root", reg.RouteFor("/Root"))
 	assert.Equal(t, "recommendhandler", reg.RouteFor("/RecommendHandler"))
+}
+
+// parentSpanIDs is the multiset of parents a set of records names.
+func parentSpanIDs(recs []map[string]interface{}) []interface{} {
+	out := make([]interface{}, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, r["parent_span_id"])
+	}
+	return out
+}
+
+func countParent(recs []map[string]interface{}, span interface{}) int {
+	n := 0
+	for _, r := range recs {
+		if r["parent_span_id"] == span {
+			n++
+		}
+	}
+	return n
 }
 
 func spanIDs(recs []map[string]interface{}) []interface{} {

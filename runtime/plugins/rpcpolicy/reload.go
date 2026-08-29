@@ -19,13 +19,21 @@ import (
 // step waits up to 2 s for the reload event, so 200 ms leaves ample margin.
 const reloadPollInterval = 200 * time.Millisecond
 
+// Stages a test hook observes inside the reload transaction.
+const (
+	reloadStageRead   = "read"
+	reloadStageStored = "stored"
+)
+
 func (s *runtimeState) startWatching() {
+	s.watchers.Add(1)
 	go s.watchFile()
 	// Register the signal handler SYNCHRONOUSLY: doing it inside the goroutine
 	// leaves a window in which SIGHUP still has its default action, which is to
 	// terminate the process -- exactly the opposite of what F9 wants.
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGHUP)
+	s.watchers.Add(1)
 	go s.watchSignal(ch)
 }
 
@@ -37,6 +45,7 @@ func (s *runtimeState) startWatching() {
 // still noticed. The first tick therefore always calls reload(), which
 // short-circuits when the bytes hash to what is already loaded.
 func (s *runtimeState) watchFile() {
+	defer s.watchers.Done()
 	t := time.NewTicker(reloadPollInterval)
 	defer t.Stop()
 	var lastMod time.Time
@@ -48,6 +57,10 @@ func (s *runtimeState) watchFile() {
 		case <-t.C:
 			fi, err := os.Stat(s.configPath)
 			if err != nil {
+				// A vanished or unreadable config file is not "no change": the
+				// old registry stays live, and the log says so ONCE per run of
+				// failures rather than five times a second forever.
+				s.noteReadFailure(err)
 				continue
 			}
 			if fi.ModTime().Equal(lastMod) && fi.Size() == lastSize {
@@ -60,6 +73,7 @@ func (s *runtimeState) watchFile() {
 }
 
 func (s *runtimeState) watchSignal(ch chan os.Signal) {
+	defer s.watchers.Done()
 	defer signal.Stop(ch)
 	for {
 		select {
@@ -78,10 +92,22 @@ func (s *runtimeState) watchSignal(ch chan os.Signal) {
 // unloadable file panics, because a live recording must not be destroyed by a
 // bad edit.
 func (s *runtimeState) reload() {
+	// The WHOLE transaction -- read, hash compare, parse, build, store, event --
+	// runs under one mutex. The file poller and the SIGHUP handler are two
+	// independent triggers; interleaved, the one that read the OLDER bytes could
+	// store last and leave a stale registry installed with the newer file's
+	// event already written.
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
 	data, err := os.ReadFile(s.configPath)
 	if err != nil {
-		s.writeReloadEvent(eventPolicyReloadFailed, "")
+		s.noteReadFailureLocked(err)
 		return
+	}
+	s.readFailed = false
+	if s.reloadHook != nil {
+		s.reloadHook(reloadStageRead)
 	}
 	sha := sha256Hex(data)
 	if prev := s.registry.Load(); prev != nil && prev.sha == sha {
@@ -92,27 +118,56 @@ func (s *runtimeState) reload() {
 	}
 	cfg, err := ParseConfig(data, s.configPath)
 	if err != nil {
-		s.writeReloadEvent(eventPolicyReloadFailed, sha)
+		s.writeReloadEvent(eventPolicyReloadFailed, sha, err.Error())
 		return
 	}
-	reg, err := buildRegistry(cfg, sha, s.registry.Load(), s.clock)
+	prev := s.registry.Load()
+	reg, err := buildRegistry(cfg, sha, prev, s.clock)
 	if err != nil {
-		s.writeReloadEvent(eventPolicyReloadFailed, sha)
+		s.writeReloadEvent(eventPolicyReloadFailed, sha, err.Error())
 		return
+	}
+	note := ""
+	if prev != nil && serverBlockChanged(prev.server, cfg.Server) {
+		note = "server: is not hot-reloaded; the running station is unchanged"
 	}
 	s.registry.Store(reg)
-	s.writeReloadEvent(eventPolicyReload, sha)
+	s.writeReloadEvent(eventPolicyReload, sha, note)
+	if s.reloadHook != nil {
+		s.reloadHook(reloadStageStored)
+	}
+}
+
+// noteReadFailure records a stat/read failure of the watched file from OUTSIDE
+// the reload transaction (the poller's stat).
+func (s *runtimeState) noteReadFailure(err error) {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	s.noteReadFailureLocked(err)
+}
+
+// noteReadFailureLocked emits ONE policy_reload_failed event per run of failures
+// to read the watched file. Deduplicated until the next successful read, so a
+// file deleted mid-run costs one line rather than five a second, and keeps the
+// old registry either way. Callers hold reloadMu.
+func (s *runtimeState) noteReadFailureLocked(err error) {
+	if s.readFailed {
+		return
+	}
+	s.readFailed = true
+	s.writeReloadEvent(eventPolicyReloadFailed, "", "cannot read "+s.configPath+": "+err.Error())
 }
 
 // writeReloadEvent records the instant and flushes: the arm step tails the log
 // for this line, so it must not sit in the buffer.
-func (s *runtimeState) writeReloadEvent(name, sha string) {
-	s.log.Write(&EventRecord{
+func (s *runtimeState) writeReloadEvent(name, sha, note string) {
+	_ = s.log.Write(&EventRecord{
 		Kind:    "event",
 		Name:    name,
 		Epoch:   epochOf(time.Now()),
 		SHA256:  sha,
 		Service: s.service,
+		Note:    note,
 	})
-	s.log.Flush()
+	_ = s.log.Flush()
 }
