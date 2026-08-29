@@ -46,9 +46,15 @@ type baseRecord struct {
 // ClientRecord is one client-side attempt.
 type ClientRecord struct {
 	baseRecord
-	Route        string  `json:"route"`
-	Profile      string  `json:"profile"`
-	Attempt      int     `json:"attempt"`
+	Route   string `json:"route"`
+	Profile string `json:"profile"`
+	Attempt int    `json:"attempt"`
+	// Peer is the gRPC dial target of the connection the attempt was issued on,
+	// as configured (`svc_a_container:12345`). The pipeline maps its host through
+	// placement.yaml to the callee service, so it is written on a gate-denied
+	// record too -- that attempt never reached the wire, but the connection it
+	// would have used is known.
+	Peer         string  `json:"peer"`
 	RetryDelayMS float64 `json:"retry_delay_ms"`
 	Gate         string  `json:"gate"`
 	DropReason   string  `json:"drop_reason"`

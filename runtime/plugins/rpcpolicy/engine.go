@@ -234,7 +234,11 @@ type invokeFunc func(ctx context.Context) error
 
 // execute is docs/PLAN.md WP1's "Client flow", a transcription of msim's
 // ClientRuntime.start_request + _start_attempt + _on_attempt_done.
-func (e *engine) execute(inbound context.Context, prof *profile, route, operation string, invoke invokeFunc) error {
+//
+// peer is the dial target of the connection every attempt of this request goes
+// out on (CONTRACTS.md §5); it is recorded even when the gate denies the
+// request, because the connection it would have used is still known.
+func (e *engine) execute(inbound context.Context, prof *profile, route, operation, peer string, invoke invokeFunc) error {
 	parent, _ := traceCtxFrom(inbound)
 	traceID := parent.traceID
 	if traceID == "" {
@@ -264,7 +268,7 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 				StartEpoch: epochOf(now), EndEpoch: epochOf(now), DurationMS: 0,
 				IsError: true, ResponseCode: codes.Unavailable.String(),
 			},
-			Route: route, Profile: prof.name, Attempt: 1, RetryDelayMS: 0,
+			Route: route, Profile: prof.name, Attempt: 1, Peer: peer, RetryDelayMS: 0,
 			Gate: gateCircuitOpen, DropReason: dropNone, RetryDenied: deniedNone,
 		})
 		return status.Errorf(codes.Unavailable, "rpcpolicy: %s: circuit open", operation)
@@ -314,7 +318,7 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 				DurationMS: msOf(endWall.Sub(startWall)),
 				IsError:    !success, ResponseCode: code.String(),
 			},
-			Route: route, Profile: prof.name, Attempt: attempt,
+			Route: route, Profile: prof.name, Attempt: attempt, Peer: peer,
 			RetryDelayMS: msOf(time.Duration(retryDelay)),
 			Gate:         "", DropReason: dropReasonFor(code), RetryDenied: deniedNone,
 		}

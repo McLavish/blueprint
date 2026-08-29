@@ -14,6 +14,10 @@ import (
 
 const testMethod = "/grpc.NodeService/Call"
 
+// testPeer is the dial target the engine records as `peer`, in the form the
+// deployment writes it: <container>:<port> (CONTRACTS.md §5).
+const testPeer = "svc_a_container:12345"
+
 func newTestEngine(t *testing.T) (*engine, *fakeClock, *testLog) {
 	t.Helper()
 	c := newFakeClock()
@@ -40,7 +44,7 @@ func TestEngineGateDeniedRootWritesOneRecordAndDoesNotInvoke(t *testing.T) {
 	prof := &profile{name: "p", timeout: 50 * time.Millisecond, retryOn: map[codes.Code]bool{codes.Unavailable: true}, head: breaker}
 
 	calls := 0
-	err := e.execute(context.Background(), prof, "root", testMethod, func(context.Context) error {
+	err := e.execute(context.Background(), prof, "root", testMethod, testPeer, func(context.Context) error {
 		calls++
 		return nil
 	})
@@ -57,6 +61,8 @@ func TestEngineGateDeniedRootWritesOneRecordAndDoesNotInvoke(t *testing.T) {
 	assert.Equal(t, true, recs[0]["is_error"])
 	assert.Equal(t, float64(1), recs[0]["attempt"])
 	assert.Equal(t, "root", recs[0]["route"])
+	assert.Equal(t, testPeer, recs[0]["peer"],
+		"a gate-denied record still names the connection the attempt would have used")
 }
 
 // Finagle's RetryFilter deposits per request that ENTERS the filter, so the
@@ -75,7 +81,7 @@ func TestEngineShedRequestDoesNotDepositIntoAWrappedBudget(t *testing.T) {
 	prof := &profile{name: "p", timeout: 50 * time.Millisecond, retryOn: map[codes.Code]bool{codes.Unavailable: true}, head: breaker}
 
 	for i := 0; i < 50; i++ {
-		err := e.execute(context.Background(), prof, "", testMethod, func(context.Context) error { return nil })
+		err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error { return nil })
 		require.Error(t, err)
 	}
 	requireTokens(t, budget, big.NewInt(0))
@@ -91,7 +97,7 @@ func TestEngineAttemptResultsReachAWrappedBreaker(t *testing.T) {
 	prof := &profile{name: "p", timeout: 50 * time.Millisecond, retryOn: map[codes.Code]bool{codes.Unavailable: true}, head: budget}
 
 	attempts := 0
-	err := e.execute(context.Background(), prof, "", testMethod, func(context.Context) error {
+	err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error {
 		attempts++
 		clock.Advance(time.Millisecond)
 		return status.Error(codes.Unavailable, "boom")
@@ -113,7 +119,7 @@ func TestEngineRequestStartsReachAWrappedBudget(t *testing.T) {
 	prof := &profile{name: "p", timeout: 50 * time.Millisecond, retryOn: map[codes.Code]bool{codes.Unavailable: true}, head: breaker}
 
 	for i := 0; i < 3; i++ {
-		require.NoError(t, e.execute(context.Background(), prof, "", testMethod, func(context.Context) error { return nil }))
+		require.NoError(t, e.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error { return nil }))
 	}
 	requireTokens(t, budget, big.NewInt(3*budget.Deposit()))
 }
@@ -182,7 +188,7 @@ func runFailing(t *testing.T, e *engine, clock *fakeClock, prof *profile) int {
 func runFailingWith(t *testing.T, e *engine, clock *fakeClock, prof *profile, serviceTime time.Duration) int {
 	t.Helper()
 	attempts := 0
-	err := e.execute(context.Background(), prof, "", testMethod, func(context.Context) error {
+	err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error {
 		attempts++
 		clock.Advance(serviceTime)
 		return status.Error(codes.Unavailable, "boom")
@@ -197,7 +203,7 @@ func TestEngineStrictDeadlineAtExactlyTheBoundary(t *testing.T) {
 	e, clock, log := newTestEngine(t)
 	prof := testProfile(t, "default_policy: a\nprofiles:\n  a:\n    timeout: 50ms\n")
 
-	err := e.execute(context.Background(), prof, "", testMethod, func(context.Context) error {
+	err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error {
 		clock.Advance(50 * time.Millisecond) // end == deadline
 		return nil
 	})
@@ -210,7 +216,7 @@ func TestEngineStrictDeadlineAtExactlyTheBoundary(t *testing.T) {
 
 	// One nanosecond earlier the same attempt succeeds.
 	e2, clock2, log2 := newTestEngine(t)
-	require.NoError(t, e2.execute(context.Background(), prof, "", testMethod, func(context.Context) error {
+	require.NoError(t, e2.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error {
 		clock2.Advance(50*time.Millisecond - 1)
 		return nil
 	}))
@@ -226,7 +232,7 @@ func TestEngineInboundCancelGivesNoFeedback(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	attempts := 0
-	err := e.execute(ctx, prof, "", testMethod, func(context.Context) error {
+	err := e.execute(ctx, prof, "", testMethod, testPeer, func(context.Context) error {
 		attempts++
 		cancel()
 		return status.Error(codes.Unavailable, "boom")
@@ -271,7 +277,7 @@ profiles:
 			e, clock, log := newTestEngine(t)
 			prof := testProfile(t, doc)
 			attempts := 0
-			err := e.execute(context.Background(), prof, "", testMethod, func(context.Context) error {
+			err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error {
 				attempts++
 				clock.Advance(time.Millisecond)
 				return status.Error(tc.code, "boom")
@@ -305,7 +311,7 @@ profiles:
 	e, clock, log := newTestEngine(t)
 	prof := testProfile(t, doc)
 	var budgets []time.Duration
-	err := e.execute(context.Background(), prof, "", testMethod, func(ctx context.Context) error {
+	err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(ctx context.Context) error {
 		d, ok := ctx.Deadline()
 		require.True(t, ok, "every attempt carries the profile's per-attempt timeout")
 		// Measured on the clock that minted the deadline, so the budget is the
@@ -346,7 +352,7 @@ profiles:
 	e, clock, _ := newTestEngine(t)
 	prof := testProfile(t, doc)
 	attempts := 0
-	err := e.execute(context.Background(), prof, "", testMethod, func(context.Context) error {
+	err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error {
 		attempts++
 		clock.Advance(10 * time.Millisecond)
 		return status.Error(codes.Unavailable, "boom")
@@ -376,7 +382,7 @@ profiles:
 	e, clock, log := newTestEngine(t)
 	prof := testProfile(t, doc)
 	attempts := 0
-	err := e.execute(context.Background(), prof, "", testMethod, func(context.Context) error {
+	err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error {
 		attempts++
 		clock.Advance(time.Millisecond)
 		if attempts < 3 {
@@ -399,7 +405,7 @@ func TestEngineMintsAFreshSpanPerAttempt(t *testing.T) {
 	e, clock, log := newTestEngine(t)
 	prof := testProfile(t, doc)
 	parent := traceCtx{traceID: "0123456789abcdef0123456789abcdef", spanID: "fedcba9876543210", route: "root"}
-	err := e.execute(withTraceCtx(context.Background(), parent), prof, "", testMethod, func(context.Context) error {
+	err := e.execute(withTraceCtx(context.Background(), parent), prof, "", testMethod, testPeer, func(context.Context) error {
 		clock.Advance(time.Millisecond)
 		return status.Error(codes.Unavailable, "boom")
 	})
@@ -428,7 +434,7 @@ func TestEngineClassifiesAgainstTheDeadlineTheInvokerReceived(t *testing.T) {
 		log := newTestLog(t)
 		e := &engine{clock: clock, log: log.attemptLog, service: "svc-test"}
 		seen := int64(-1)
-		err := e.execute(context.Background(), prof, "", testMethod, func(attemptCtx context.Context) error {
+		err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(attemptCtx context.Context) error {
 			d, ok := attemptCtx.Deadline()
 			require.True(t, ok)
 			seen = clock.DeadlineNS(d)
