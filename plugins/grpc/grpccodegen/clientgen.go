@@ -28,6 +28,7 @@ func GenerateClient(builder golang.ModuleBuilder, service *gocode.ServiceInterfa
 		"context", "time",
 		"google.golang.org/grpc",
 		"google.golang.org/grpc/credentials/insecure",
+		"github.com/blueprint-uservices/blueprint/runtime/plugins/rpcpolicy",
 	)
 
 	slog.Info(fmt.Sprintf("Generating %v/%v.go", client.Package.PackageName, client.Name))
@@ -59,11 +60,7 @@ type {{.Name}} struct {
 func New_{{.Name}}(ctx context.Context, serverAddress string) (*{{.Name}}, error) {
 	var opts []grpc.DialOption
 	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	duration, err := time.ParseDuration("1s")
-	if err != nil {
-		return nil, err
-	}
-	opts = append(opts, grpc.WithTimeout(duration))
+	opts = append(opts, rpcpolicy.DialOptions()...)
 	conn, err := grpc.Dial(serverAddress, opts...)
 	if err != nil {
 		return nil, err
@@ -71,7 +68,7 @@ func New_{{.Name}}(ctx context.Context, serverAddress string) (*{{.Name}}, error
 
 	c := &{{.Name}}{}
 	c.Client = New{{.Service.Name}}Client(conn)
-	c.Timeout = duration
+	c.Timeout = rpcpolicy.DefaultCallTimeout
 	return c, nil
 }
 
@@ -84,7 +81,7 @@ func (client *{{$receiver}}) {{SignatureWithRetVars $f}} {
 	req.marshall({{ArgVars $f}})
 
 	// Configure the client-side request timeout
-	ctx, cancel := context.WithTimeout(ctx, client.Timeout)
+	ctx, cancel := rpcpolicy.CallContext(ctx, client.Timeout)
 	defer cancel()
 
 	// Make the remote call

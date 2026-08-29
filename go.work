@@ -1,6 +1,6 @@
 go 1.25.0
 
-toolchain go1.22.1
+toolchain go1.25.0
 
 use (
 	./blueprint
@@ -13,6 +13,8 @@ use (
 	./examples/dsb_sn/workflow
 	./examples/leaf/wiring
 	./examples/leaf/workflow
+	./examples/predicted/wiring
+	./examples/predicted/workflow
 	./examples/sockshop/tests
 	./examples/sockshop/wiring
 	./examples/sockshop/workflow

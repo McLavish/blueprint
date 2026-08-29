@@ -26,7 +26,8 @@ func GenerateServerHandler(builder golang.ModuleBuilder, service *gocode.Service
 		Imports: gogen.NewImports(pkg.Name),
 	}
 
-	server.Imports.AddPackages("context", "encoding/json", "net/http", "github.com/gorilla/mux")
+	server.Imports.AddPackages("context", "encoding/json", "net/http", "github.com/gorilla/mux",
+		"github.com/blueprint-uservices/blueprint/runtime/plugins/rpcpolicy")
 
 	slog.Info(fmt.Sprintf("Generating %v/%v_HTTPServer.go", server.Package.PackageName, service.BaseName))
 	outputFile := filepath.Join(server.Package.Path, service.BaseName+"_HTTPServer.go")
@@ -67,6 +68,7 @@ func (handler *{{.Name}}) Run(ctx context.Context) error {
 	{{ range $_, $f := .Service.Methods }}
 	router.Path("/{{$f.Name}}").HandlerFunc(handler.{{$f.Name}})
 	{{end}}
+	router.Use(rpcpolicy.HTTPMiddleware())
 	srv := &http.Server {
 		Addr: handler.Address,
 		Handler: router,
@@ -104,7 +106,7 @@ func (handler *{{$receiver}}) {{$f.Name -}}
 	}
 	{{- end}}
 	{{end}}
-	ctx := context.Background()
+	ctx := r.Context()
 	{{RetVars $f "err"}} {{HasNewReturnVars $f}} handler.Service.{{$f.Name}}({{ArgVars $f "ctx"}})
 	if err != nil {
 		http.Error(w, err.Error(), 500)
