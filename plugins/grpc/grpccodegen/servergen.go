@@ -31,6 +31,7 @@ func GenerateServerHandler(builder golang.ModuleBuilder, service *gocode.Service
 	server.Imports.AddPackages(
 		"context", "net",
 		"google.golang.org/grpc",
+		"github.com/blueprint-uservices/blueprint/runtime/plugins/rpcpolicy",
 	)
 
 	slog.Info(fmt.Sprintf("Generating %v/%v_GRPCServer.go", server.Package.PackageName, service.Name))
@@ -73,7 +74,7 @@ func (handler *{{.Name}}) Run(ctx context.Context) error {
 		return err
 	}
 
-	s := grpc.NewServer()
+	s := grpc.NewServer(rpcpolicy.ServerOptions()...)
 	Register{{.Service.Name}}Server(s, handler)
 
 	go func() {
