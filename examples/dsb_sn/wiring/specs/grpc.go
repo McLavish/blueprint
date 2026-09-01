@@ -23,7 +23,7 @@ import (
 // (`wrk2api_service`) stays HTTP -- it is the driven front door.
 //
 // Everything else is `docker` verbatim: the same thirteen services, the same
-// four MongoDB and four memcached containers, and the same process/container
+// five MongoDB and five memcached containers, and the same process/container
 // names (including upstream's `socailgraph_proc` typo, which is a name the
 // placement files and the compose splitter read).
 //
