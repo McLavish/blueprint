@@ -22,5 +22,6 @@ func main() {
 	cmdbuilder.MakeAndExecute(
 		name,
 		specs.Docker,
+		specs.Grpc,
 	)
 }

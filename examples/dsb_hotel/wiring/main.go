@@ -21,5 +21,6 @@ func main() {
 		name,
 		specs.Original,
 		specs.V2,
+		specs.Campaign,
 	)
 }
