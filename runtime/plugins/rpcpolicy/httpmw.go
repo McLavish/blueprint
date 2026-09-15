@@ -1,7 +1,11 @@
 package rpcpolicy
 
 import (
+	"context"
+	"errors"
 	"net/http"
+
+	"google.golang.org/grpc/codes"
 )
 
 // The front-door HTTP middleware: it reads the driver's traceparent, stamps the
@@ -41,6 +45,19 @@ func (s *runtimeState) httpMiddleware() func(http.Handler) http.Handler {
 			start := s.clock.Now()
 			next.ServeHTTP(sw, r.WithContext(ctx))
 			end := s.clock.Now()
+			// The same rule the client records follow: when the ROOT's own
+			// deadline is what ended the request, the record ends AT that
+			// deadline rather than whenever this goroutine was next scheduled
+			// (see clampToDeadline). A root deadline exists only if something
+			// upstream of this middleware put one on the request context
+			// (http.TimeoutHandler, a driver-supplied one); the campaign's
+			// front doors do not, so this is the defensive half of the rule.
+			// Both halves must hold -- the context expired AND the response
+			// says so -- or the observation stands as taken.
+			if d, ok := ctx.Deadline(); ok && errors.Is(ctx.Err(), context.DeadlineExceeded) &&
+				httpCodeName(sw.status) == codes.DeadlineExceeded.String() {
+				end = clampToDeadline(start, end, d)
+			}
 
 			// The root record is the only place the driver's HTTP status and
 			// the trace id meet; root_metrics joins on trace_id.

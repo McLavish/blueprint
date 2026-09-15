@@ -223,6 +223,127 @@ func TestEngineStrictDeadlineAtExactlyTheBoundary(t *testing.T) {
 	assert.Equal(t, "OK", log2.ofKind("client")[0]["response_code"])
 }
 
+// msim books a timeout AT the deadline. The pipeline buckets every caller-side
+// column at the client record's END, so a goroutine that wakes late after its
+// own deadline used to move the timeout into the next bucket -- and only that
+// case: a status the callee really produced, at whatever instant, is an
+// observation and stands.
+func TestEngineARecordEndsAtItsOwnDeadlineOnlyWhenThatDeadlineEndedIt(t *testing.T) {
+	t.Run("the attempt's own deadline, observed ten ms late", func(t *testing.T) {
+		e, clock, log := newTestEngine(t)
+		prof := testProfile(t, "default_policy: a\nprofiles:\n  a:\n    timeout: 20ms\n")
+
+		var deadline time.Time
+		err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(ctx context.Context) error {
+			d, ok := ctx.Deadline()
+			require.True(t, ok)
+			deadline = d
+			<-ctx.Done()                         // the attempt's own deadline fires...
+			clock.Advance(30 * time.Millisecond) // ...and this goroutine wakes ten ms later
+			return status.FromContextError(ctx.Err()).Err()
+		})
+		require.Error(t, err)
+		assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+
+		recs := log.ofKind("client")
+		require.Len(t, recs, 1)
+		assert.Equal(t, epochOf(deadline), recs[0]["end_epoch"],
+			"the record ends at the deadline, not when the goroutine woke to hear about it")
+		assert.Equal(t, 20.0, recs[0]["duration_ms"])
+		assert.Equal(t, dropDeadline, recs[0]["drop_reason"])
+	})
+
+	t.Run("the strict rule converted it, before the context's timer had fired", func(t *testing.T) {
+		e, clock, log := newTestEngine(t)
+		// An hour out, so the context's REAL timer cannot fire during the test:
+		// the only thing here that can say the deadline passed is the strict
+		// comparison, made on the clock the engine and the callee share.
+		prof := testProfile(t, "default_policy: a\nprofiles:\n  a:\n    timeout: 1h\n")
+
+		var deadline time.Time
+		err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(ctx context.Context) error {
+			d, ok := ctx.Deadline()
+			require.True(t, ok)
+			deadline = d
+			clock.Advance(time.Hour + 2*time.Microsecond) // an OK, two microseconds past D
+			require.NoError(t, ctx.Err(),
+				"the context's timer callback has not run: the local expiry flag alone misses this")
+			return nil
+		})
+		require.Error(t, err)
+		assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+
+		recs := log.ofKind("client")
+		require.Len(t, recs, 1)
+		assert.Equal(t, "DeadlineExceeded", recs[0]["response_code"])
+		assert.Equal(t, epochOf(deadline), recs[0]["end_epoch"],
+			"the conversion IS the assertion that the deadline passed, so the record ends at it")
+		assert.Equal(t, 3600000.0, recs[0]["duration_ms"])
+		assert.Equal(t, dropDeadline, recs[0]["drop_reason"])
+	})
+
+	t.Run("a DeadlineExceeded from the callee, while the local deadline is live", func(t *testing.T) {
+		e, clock, log := newTestEngine(t)
+		prof := testProfile(t, "default_policy: a\nprofiles:\n  a:\n    timeout: 1s\n")
+
+		err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error {
+			clock.Advance(5 * time.Millisecond)
+			return status.Error(codes.DeadlineExceeded, "the callee's own deadline, which is nearer")
+		})
+		require.Error(t, err)
+
+		recs := log.ofKind("client")
+		require.Len(t, recs, 1)
+		assert.Equal(t, epochOf(clock.Now()), recs[0]["end_epoch"],
+			"nothing local expired, so the record ends where the answer arrived")
+		assert.Equal(t, 5.0, recs[0]["duration_ms"])
+	})
+
+	// The documented cost of clamping on the local expiry flag, pinned so that it
+	// is a decision and not a surprise: the callee's answer really arrived one
+	// millisecond inside the local deadline, and is booked AT it.
+	t.Run("the accepted over-clamp: an arrival this goroutine slept past", func(t *testing.T) {
+		e, clock, log := newTestEngine(t)
+		prof := testProfile(t, "default_policy: a\nprofiles:\n  a:\n    timeout: 20ms\n")
+
+		var deadline time.Time
+		err := e.execute(context.Background(), prof, "", testMethod, testPeer, func(ctx context.Context) error {
+			d, ok := ctx.Deadline()
+			require.True(t, ok)
+			deadline = d
+			// The callee's own deadline, which is nearer, answers at 19 ms...
+			clock.Advance(19 * time.Millisecond)
+			calleeErr := status.Error(codes.DeadlineExceeded, "the callee's own deadline, which is nearer")
+			// ...and this goroutine is not scheduled again until after 20 ms, by
+			// which point nothing here can tell that arrival from the local expiry.
+			<-ctx.Done()
+			clock.Advance(5 * time.Millisecond)
+			return calleeErr
+		})
+		require.Error(t, err)
+
+		recs := log.ofKind("client")
+		require.Len(t, recs, 1)
+		assert.Equal(t, epochOf(deadline), recs[0]["end_epoch"],
+			"ACCEPTED: booked at the local deadline, which is nearer to the true 19 ms than the wake-up is")
+		assert.Equal(t, 20.0, recs[0]["duration_ms"])
+	})
+
+	t.Run("a success is never clamped", func(t *testing.T) {
+		e, clock, log := newTestEngine(t)
+		prof := testProfile(t, "default_policy: a\nprofiles:\n  a:\n    timeout: 1s\n")
+
+		require.NoError(t, e.execute(context.Background(), prof, "", testMethod, testPeer, func(context.Context) error {
+			clock.Advance(7 * time.Millisecond)
+			return nil
+		}))
+		recs := log.ofKind("client")
+		require.Len(t, recs, 1)
+		assert.Equal(t, epochOf(clock.Now()), recs[0]["end_epoch"])
+		assert.Equal(t, 7.0, recs[0]["duration_ms"])
+	})
+}
+
 // An attempt the caller abandoned is not evidence about the callee: it must
 // reach no policy layer.
 func TestEngineInboundCancelGivesNoFeedback(t *testing.T) {

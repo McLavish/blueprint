@@ -84,6 +84,25 @@ func deadlineNS(c Clock, ctx context.Context) (int64, bool) {
 	return c.DeadlineNS(d), true
 }
 
+// clampToDeadline is the instant a record ends at when the thing that ended it
+// was the expiry of its own deadline: msim fires the caller's clock AT the
+// deadline, so the record ends there however late the goroutine woke to hear
+// about it.
+//
+// It is min(end, deadline), floored at the record's own start: an observation
+// taken before the deadline is left where it landed -- the clamp never pushes a
+// record's end FORWARD to a deadline nothing reached -- and a deadline that had
+// already passed when the attempt began cannot drag the end before the start.
+func clampToDeadline(start, end, deadline time.Time) time.Time {
+	if end.After(deadline) {
+		end = deadline
+	}
+	if end.Before(start) {
+		return start
+	}
+	return end
+}
+
 // profile is a compiled ProfileConfig: the policy chain plus the two timeouts
 // and the retryable-code set.
 //
@@ -289,7 +308,8 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 		// it back is the only way the comparison below is guaranteed to be the
 		// same instant the invoker will be cut at.
 		attemptCtx, cancel := e.clock.WithTimeout(ctx, prof.timeout)
-		attemptDeadline, hasAttemptDeadline := deadlineNS(e.clock, attemptCtx)
+		attemptDeadlineWall, hasAttemptDeadline := attemptCtx.Deadline()
+		attemptDeadline := e.clock.DeadlineNS(attemptDeadlineWall)
 		outCtx := metadata.AppendToOutgoingContext(attemptCtx,
 			TraceparentKey, formatTraceparent(traceID, spanID),
 			RouteKey, route,
@@ -298,17 +318,63 @@ func (e *engine) execute(inbound context.Context, prof *profile, route, operatio
 		err := invoke(outCtx)
 		endWall := e.clock.Now()
 		end := e.clock.NowNS()
+		// Whether it was THIS attempt's own deadline that ended it -- its
+		// per-attempt timeout or the root deadline it inherited, whichever
+		// WithTimeout made the nearer. Read before cancel(), which would turn the
+		// same context's Err() into a plain Canceled.
+		//
+		// It is one of the two signals the clamp below accepts, and the weaker
+		// one: it reports the context's TIMER, which fires a little after the
+		// instant the deadline names (see there).
+		localExpiry := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
 		cancel()
 
 		code := codeOf(err)
 		// Strict half-open deadline: success requires end < deadline. The same
 		// rule runs on the server side, so both books the same attempt the
 		// same way.
+		strictConverted := false
 		if code == codes.OK && hasAttemptDeadline && end >= attemptDeadline {
-			code = codes.DeadlineExceeded
+			code, strictConverted = codes.DeadlineExceeded, true
 			err = status.Errorf(codes.DeadlineExceeded, "rpcpolicy: %s: attempt finished at its deadline", operation)
 		}
 		success := code == codes.OK
+
+		// msim books a timeout AT the deadline: the caller's clock fires there,
+		// and the attempt ends there. A Go client learns of its own expiry only
+		// when its goroutine is next scheduled, and the pipeline buckets every
+		// caller-side column at the client record's END -- so a wake-up ten
+		// milliseconds late moved the timeout into the next bucket, where the
+		// simulator had booked it in this one.
+		//
+		// Only this attempt's OWN deadline may move the record: a DeadlineExceeded
+		// the callee returned while the local context is still live is a real
+		// observation at a real instant (the callee's deadline is its own, and
+		// nearer), and so is every other status. The retry engine still decides at
+		// wake-up, off `end`, because it has nothing else to decide with -- it is
+		// the RECORD that ends at the deadline.
+		//
+		// TWO things say this attempt's own deadline passed, and either is enough.
+		// The strict rule above is the stronger of them: converting the result IS
+		// the assertion end >= attemptDeadline, made on the one clock both sides
+		// compare against, while attemptCtx.Err() only becomes DeadlineExceeded
+		// once the runtime has got around to running the context's timer callback.
+		// An OK returned two microseconds past D and converted here while Err() was
+		// still nil therefore used to end at the observation -- a late wake-up
+		// included -- where msim books it at D.
+		//
+		// The reverse is possible and is ACCEPTED: a callee-originated
+		// DeadlineExceeded that really arrived at 0.999 s under a local 1.000 s
+		// deadline, whose goroutine was then descheduled past 1.000 s before it
+		// read Err(), is clamped to 1.000 s. Once this goroutine has slept past its
+		// own deadline, nothing in the process can still tell that earlier arrival
+		// from the local expiry -- and of the two instants it could be given, the
+		// deadline is the nearer to the one it really had.
+		//
+		// The clamp itself is min(now, deadline), floored at the record's start.
+		if code == codes.DeadlineExceeded && (strictConverted || localExpiry) && hasAttemptDeadline {
+			endWall = clampToDeadline(startWall, endWall, attemptDeadlineWall)
+		}
 
 		rec := &ClientRecord{
 			baseRecord: baseRecord{

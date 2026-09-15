@@ -34,6 +34,24 @@ type runtimeState struct {
 	faults     *faultInjector
 	registry   atomic.Pointer[Registry]
 
+	// beforeClaim is a test-only seam, nil in production and set before the
+	// state is used. It runs on the goroutine that ran the work, in the one
+	// window the station cannot see into: after the work stamped the instant it
+	// ended at and the state it ended under, and before either is turned into a
+	// claim under the station mutex. The tests hold a handler exactly there to
+	// make the station's reaper win, or lose, on purpose rather than by
+	// scheduling luck -- and to let the world move on inside that window (a
+	// deadline passing, a context ending) where a goroutine that re-read it
+	// would be reading about a different instant than the one it is claiming.
+	beforeClaim func()
+	// betweenCompletionReads is a second test-only seam, nil in production: it
+	// runs on the work's goroutine between its two observations at the
+	// handler's return -- after the context's state was read and before the
+	// instant is stamped -- so a test can end the context exactly there and
+	// prove that an expiry in that gap is not blamed for a completion that
+	// preceded it.
+	betweenCompletionReads func()
+
 	stopReload chan struct{}
 	stopOnce   sync.Once
 	// watchers joins the file poller and the SIGHUP handler at shutdown, so the
@@ -99,7 +117,7 @@ func initialize(configPath, logDir, service string) *runtimeState {
 	if err != nil {
 		panic(fmt.Sprintf("rpcpolicy: %v", err))
 	}
-	reg, err := buildRegistry(cfg, sha256Hex(data), nil, clock)
+	reg, err := buildRegistry(cfg, sha256Hex(data), nil, clock, log)
 	if err != nil {
 		panic(fmt.Sprintf("rpcpolicy: %s: %v", configPath, err))
 	}

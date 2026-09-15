@@ -1,7 +1,6 @@
 package rpcpolicy
 
 import (
-	"context"
 	"fmt"
 	"math"
 	"math/rand"
@@ -9,8 +8,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"google.golang.org/grpc/status"
 )
 
 // Fault injection (docs/CONTRACTS.md §4), ported from
@@ -180,14 +177,17 @@ func (f *faultInjector) activeLatency(method string) float64 {
 	return latency
 }
 
-// activePFail is the active p_fail for a method at the current instant: the max
-// over the live windows, re-read immediately before the roll. msim's
-// _finish_service evaluates _fails_now(now) at the COMPLETION instant
-// (service.py:435 -> :216), so a handler that runs into or out of a short
-// window is governed by the probability in force when it finishes, not by the
-// one in force when it started.
-func (f *faultInjector) activePFail(method string) float64 {
-	_, pFail := f.active(method)
+// pFailAt is the active p_fail for a method AT a given instant: the max over
+// the windows live there. msim's _finish_service evaluates _fails_now(now) at
+// the COMPLETION instant (service.py:435 -> :216), so a handler that runs into
+// or out of a short window is governed by the probability in force when it
+// FINISHED -- which is the instant the worker goroutine stamped, never a fresh
+// reading taken once the interceptor was next scheduled.
+func (f *faultInjector) pFailAt(method string, at time.Time) float64 {
+	if f == nil {
+		return 0
+	}
+	_, pFail := activeFault(f.schedule, f.epochMs, at, method)
 	return pFail
 }
 
@@ -231,19 +231,6 @@ func activeFault(schedule *FaultSchedule, epochMs int64, now time.Time, method s
 		}
 	}
 	return addLatencyMS, pFail
-}
-
-// sleepCtx waits out d, or gives up as soon as the caller does. The context
-// error is returned as a status so it keeps its Canceled/DeadlineExceeded code.
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return status.FromContextError(ctx.Err()).Err()
-	}
 }
 
 // faultInjectorFromEnv builds the injector from FAULT_CONFIG_PATH +

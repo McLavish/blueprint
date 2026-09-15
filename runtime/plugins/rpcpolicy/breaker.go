@@ -304,7 +304,17 @@ func (p *TimeBasedCircuitBreakerPolicy) AddResult(success bool, now int64) {
 		if probes < 1 {
 			probes = 1
 		}
-		if total >= probes && rate < (1-p.successRate) {
+		// Close when the probes' SUCCESS rate reaches the threshold -- the same
+		// `>=` the count-based breaker applies to its success ratio. Compared on
+		// the success side rather than as `rate < 1 - thr`: the strict form could
+		// never be met at thr=1.0 (a breaker asked to close only on all-successful
+		// probes re-opened on two successes), and the float `1 - 0.8` is not 0.2,
+		// so 4 of 5 probes missed it too.
+		successRate := 0.0
+		if total > 0 {
+			successRate = float64(total-failures) / float64(total)
+		}
+		if total >= probes && successRate >= p.successRate {
 			p.state = CBClosed
 			p.openedAt, p.hasOpenedAt = 0, false
 			// Fresh metrics after recovery; otherwise half-open probe results

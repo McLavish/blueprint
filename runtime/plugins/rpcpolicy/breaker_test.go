@@ -111,6 +111,78 @@ func TestTimeCircuitBreakerResetsWindowOnClose(t *testing.T) {
 	assert.Equal(t, CBOpen, p.GetState())
 }
 
+// --- the time-based half-open close boundary -------------------------------
+//
+// HALF_OPEN closes when the probes' SUCCESS rate REACHES the threshold
+// (msim's TestTimeBasedBreakerCloseBoundary). The rule used to be
+// `failure_rate < 1 - success_threshold_rate`, strict and computed on the
+// failure side. At success_threshold_rate=1.0 that is `0 < 0`, never true, so a
+// breaker configured to close only on all-successful probes re-opened after its
+// first full batch; and `1 - 0.8` is 0.19999... in floating point, so 4
+// successful probes out of 5 missed an 80% threshold.
+
+// halfOpenTimeBreaker drives a fresh time-based breaker to HALF_OPEN on
+// `minRequests` failures, then hands it back ready for probes.
+func halfOpenTimeBreaker(t *testing.T, successRate float64, minRequests, halfOpenMin int) *TimeBasedCircuitBreakerPolicy {
+	t.Helper()
+	p := mustTimeBreaker(t, 0.5, successRate, minRequests, 10*secondNS, 1, halfOpenMin, NewNoRetryPolicy())
+	for i := 0; i < minRequests; i++ {
+		p.AddResult(false, int64(i))
+	}
+	require.Equal(t, CBOpen, p.GetState())
+	require.True(t, p.AllowRequest(10))
+	require.Equal(t, CBHalfOpen, p.GetState())
+	return p
+}
+
+// thr=1.0: the old strict form could never be met, so the breaker re-opened on
+// two successful probes.
+func TestTimeBreakerAllSuccessfulProbesCloseABreakerThatDemandsAll(t *testing.T) {
+	p := halfOpenTimeBreaker(t, 1.0, 2, 2)
+	p.AddResult(true, 11)
+	p.AddResult(true, 12)
+	assert.Equal(t, CBClosed, p.GetState())
+}
+
+func TestTimeBreakerExactlyTheThresholdCloses(t *testing.T) {
+	p := halfOpenTimeBreaker(t, 0.8, 2, 5)
+	for i, ok := range []bool{true, true, true, true, false} {
+		p.AddResult(ok, int64(11+i))
+	}
+	assert.Equal(t, CBClosed, p.GetState())
+}
+
+func TestTimeBreakerOneBelowTheThresholdReopens(t *testing.T) {
+	p := halfOpenTimeBreaker(t, 0.8, 2, 5)
+	for i, ok := range []bool{true, true, true, false, false} {
+		p.AddResult(ok, int64(11+i))
+	}
+	assert.Equal(t, CBOpen, p.GetState())
+}
+
+// The float boundary itself. The three msim cases above all decide on two
+// probes, because the quorum is max(1, min(min_requests, half_open_min_requests))
+// and min_requests is 2 there; with min_requests raised to 5 the quorum really
+// is 5, so 4 successes out of 5 is exactly 0.8 -- which `rate < 1 - 0.8` missed,
+// 0.2 not being less than 0.19999999999999996.
+func TestTimeBreakerFourOfFiveProbesMeetsAnEightyPercentThreshold(t *testing.T) {
+	p := halfOpenTimeBreaker(t, 0.8, 5, 5)
+	for i, ok := range []bool{true, true, true, true, false} {
+		p.AddResult(ok, int64(11+i))
+	}
+	assert.Equal(t, CBClosed, p.GetState())
+}
+
+// ...and a failure among the probes that leaves the rate BELOW the threshold
+// re-opens, exactly as before.
+func TestTimeBreakerThreeOfFiveProbesReopens(t *testing.T) {
+	p := halfOpenTimeBreaker(t, 0.8, 5, 5)
+	for i, ok := range []bool{true, true, true, false, false} {
+		p.AddResult(ok, int64(11+i))
+	}
+	assert.Equal(t, CBOpen, p.GetState())
+}
+
 // The incremental failure counter must agree with a full rescan of the window
 // at every step; the O(n^2) rescan is what it replaced.
 func TestTimeBreakerIncrementalCountersMatchFullRescan(t *testing.T) {

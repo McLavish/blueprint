@@ -5,7 +5,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,6 +78,9 @@ func TestFaultLatencyAbortsWhenTheDeadlineExpires(t *testing.T) {
 	assert.Equal(t, outcomeDeadlineAtFinish, recs[0]["admission_outcome"],
 		"expiring in service is the same class of outcome whether it happens in the injected sleep or the handler")
 	assert.GreaterOrEqual(t, recs[0]["injected_ms"], 15.0, "the worker was held for the part of the sleep that ran")
+	assert.LessOrEqual(t, recs[0]["injected_ms"], 25.0, "and only until the deadline cut it, not for the whole 500 ms")
+	assert.Equal(t, true, recs[0]["occupancy_censored"],
+		"the injected latency is service time too, so a cut inside it is censored")
 }
 
 // The window is half-open [start_s, end_s), matching msim's TimeInterval and
@@ -286,8 +288,12 @@ func TestFaultOnlyAffectsTheMethodTheRuleNames(t *testing.T) {
 // the window escapes it, even though it was inside the window when it started.
 // The additive latency is the other half of the fault and is deliberately NOT
 // re-read: it is what occupies the permit, so it is fixed at admission.
+//
+// The completion instant is the one the WORKER stamped when the handler
+// returned, not a fresh reading taken once the interceptor was scheduled again,
+// so the whole case runs on virtual time: the handler places the finish exactly
+// on the far side of a window edge.
 func TestFaultPFailIsEvaluatedAtTheRollInstant(t *testing.T) {
-	base := time.UnixMilli(1_700_000_000_000)
 	const doc = "default_policy: a\nprofiles:\n  a:\n    timeout: 1s\nserver:\n  workers: 2\n  queue_capacity: 4\n"
 
 	for _, tc := range []struct {
@@ -326,14 +332,18 @@ func TestFaultPFailIsEvaluatedAtTheRollInstant(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newTestStateWithFaults(t, doc, scheduleOf(tc.rules...), base.UnixMilli(),
-				func() float64 { return 0.0 })
-			var at atomic.Int64
-			at.Store(int64(tc.admitAt))
-			s.faults.now = func() time.Time { return base.Add(time.Duration(at.Load())) }
+			clock := newFakeClock()
+			s := newTestStateOn(t, clock, t.TempDir(), "svc-test", doc,
+				scheduleOf(tc.rules...), clock.Now().UnixMilli(), func() float64 { return 0.0 })
+			// One timeline for both halves of a fault: the latency is read here,
+			// at admission, and the probability at the completion below.
+			s.faults.now = clock.Now
+			clock.Advance(tc.admitAt)
 
 			_, err := s.serve(context.Background(), nil, testMethod, func(context.Context, interface{}) (interface{}, error) {
-				at.Store(int64(tc.finishAt)) // the handler spans the window edge
+				// The handler spans the window edge, landing exactly on finishAt
+				// however much of it the injected latency already spent.
+				clock.Advance(time.Duration(int64(tc.finishAt) - clock.NowNS()))
 				return "ok", nil
 			})
 

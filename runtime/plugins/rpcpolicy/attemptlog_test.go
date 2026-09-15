@@ -28,9 +28,15 @@ var (
 		"route", "profile", "attempt", "peer", "retry_delay_ms", "gate", "drop_reason", "retry_denied")
 	serverKeys = append(append([]string{}, baseKeys...),
 		"admission_outcome", "admission_wait_ms", "admission_queue_depth", "admission_workers_busy",
-		"injected_ms", "handler_ms", "permit_released_at", "fault_hit")
+		"injected_ms", "handler_ms", "queue_depth_at_end", "occupancy_censored", "permit_released_at",
+		"fault_hit")
 	rootKeys  = append(append([]string{}, baseKeys...), "route", "http_status")
 	eventKeys = []string{"kind", "name", "epoch", "sha256", "service"}
+	// A discard event is not a span: it carries the identity fields of the
+	// server record it belongs to, and the instant the dispatcher dropped the
+	// entry. Nothing else.
+	discardKeys = []string{
+		"kind", "trace_id", "span_id", "parent_span_id", "service", "operation", "at_epoch"}
 )
 
 func assertKeySet(t *testing.T, want []string, rec map[string]interface{}) {
@@ -81,6 +87,7 @@ func TestServerRecordKeySet(t *testing.T) {
 	assert.Equal(t, 0.0, recs[0]["admission_queue_depth"])
 	assert.Equal(t, 0.0, recs[0]["admission_workers_busy"])
 	assert.Equal(t, false, recs[0]["fault_hit"])
+	assert.Equal(t, false, recs[0]["occupancy_censored"], "the handler ran to completion")
 }
 
 func TestRootRecordKeySet(t *testing.T) {
@@ -119,6 +126,59 @@ func TestRootRecordCapturesANonOKStatus(t *testing.T) {
 	assert.Equal(t, "root", recs[0]["route"], "the default route key is the lowercased path")
 	assert.Len(t, recs[0]["trace_id"], 32, "a request without traceparent starts a fresh trace")
 	assert.Equal(t, "", recs[0]["parent_span_id"])
+}
+
+// The root record follows the same rule as a client attempt (see
+// clampToDeadline): when the ROOT's own deadline is what ended the request, the
+// record ends AT that deadline rather than whenever the handler was finally
+// scheduled to return. Both halves must hold, though -- a handler that ignores
+// an expired deadline and answers anyway is reporting a real instant.
+func TestRootRecordEndsAtTheRootsOwnDeadline(t *testing.T) {
+	const doc = "default_policy: a\nprofiles:\n  a:\n    timeout: 1s\n"
+
+	for _, tc := range []struct {
+		name     string
+		status   int
+		wantEnd  func(deadline, observed time.Time) time.Time
+		wantCode string
+	}{
+		{
+			name:     "the deadline ended it",
+			status:   http.StatusGatewayTimeout,
+			wantEnd:  func(deadline, _ time.Time) time.Time { return deadline },
+			wantCode: "DeadlineExceeded",
+		},
+		{
+			name:     "the handler answered anyway",
+			status:   http.StatusOK,
+			wantEnd:  func(_, observed time.Time) time.Time { return observed },
+			wantCode: "OK",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := newFakeClock()
+			s := newTestStateOn(t, clock, t.TempDir(), "svc-test", doc, nil, 0, nil)
+			start := clock.Now()
+			deadline := start.Add(20 * time.Millisecond)
+
+			h := s.httpMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				<-r.Context().Done()                 // the root's own deadline passes...
+				clock.Advance(50 * time.Millisecond) // ...and the handler returns well after it
+				w.WriteHeader(tc.status)
+			}))
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			defer cancel()
+			h.ServeHTTP(httptest.NewRecorder(),
+				httptest.NewRequest(http.MethodGet, "/Root", nil).WithContext(ctx))
+
+			recs := s.tlog.ofKind("root")
+			require.Len(t, recs, 1)
+			assert.Equal(t, tc.wantCode, recs[0]["response_code"])
+			want := tc.wantEnd(deadline, clock.Now())
+			assert.Equal(t, epochOf(want), recs[0]["end_epoch"])
+			assert.Equal(t, msOf(want.Sub(start)), recs[0]["duration_ms"])
+		})
+	}
 }
 
 func TestEventRecordKeySet(t *testing.T) {
