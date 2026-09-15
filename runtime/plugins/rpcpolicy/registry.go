@@ -31,8 +31,10 @@ type Registry struct {
 }
 
 // buildRegistry compiles cfg. prev may be nil; when it is not, profiles whose
-// serialized block is byte-identical are carried over untouched.
-func buildRegistry(cfg *Config, sha string, prev *Registry, clock Clock) (*Registry, error) {
+// serialized block is byte-identical are carried over untouched. `log` is where
+// the admission station writes its own events (the discard); it is only used
+// when a station is built, which is on the first build alone.
+func buildRegistry(cfg *Config, sha string, prev *Registry, clock Clock, log *attemptLog) (*Registry, error) {
 	r := &Registry{
 		cfg:    cfg,
 		sha:    sha,
@@ -82,7 +84,7 @@ func buildRegistry(cfg *Config, sha string, prev *Registry, clock Clock) (*Regis
 		r.station = prev.station
 		r.server = prev.server
 	} else if cfg.Server != nil {
-		r.station = newStation(cfg.Server, clock)
+		r.station = newStation(cfg.Server, clock, log)
 	}
 	return r, nil
 }

@@ -122,7 +122,7 @@ func (s *runtimeState) reload() {
 		return
 	}
 	prev := s.registry.Load()
-	reg, err := buildRegistry(cfg, sha, prev, s.clock)
+	reg, err := buildRegistry(cfg, sha, prev, s.clock, s.log)
 	if err != nil {
 		s.writeReloadEvent(eventPolicyReloadFailed, sha, err.Error())
 		return

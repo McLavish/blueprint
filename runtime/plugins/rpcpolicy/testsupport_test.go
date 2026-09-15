@@ -75,6 +75,43 @@ func (c *fakeClock) WithTimeout(ctx context.Context, d time.Duration) (context.C
 	return context.WithDeadline(ctx, c.Now().Add(d))
 }
 
+// handoffClock is a fakeClock that LEAPS forward once, on the next observation
+// after Arm: that observation still reads the instant the test placed, and every
+// observation after it reads `leap` later.
+//
+// It exists to separate two instants the station used to conflate: the instant a
+// worker is handed over -- the dispatcher's single observation, taken inside
+// permit.release -- and the instant the waiting goroutine is next scheduled,
+// which is every observation after it. A station that decides the
+// permit-versus-deadline race at wake-up reads the late one.
+type handoffClock struct {
+	*fakeClock
+	mu    sync.Mutex
+	leap  time.Duration
+	armed bool
+}
+
+func newHandoffClock() *handoffClock { return &handoffClock{fakeClock: newFakeClock()} }
+
+// Arm makes the NEXT observation the last one to read the current instant.
+func (c *handoffClock) Arm(leap time.Duration) {
+	c.mu.Lock()
+	c.leap, c.armed = leap, true
+	c.mu.Unlock()
+}
+
+func (c *handoffClock) Now() time.Time {
+	now := c.fakeClock.Now()
+	c.mu.Lock()
+	leap, armed := c.leap, c.armed
+	c.armed = false
+	c.mu.Unlock()
+	if armed {
+		c.fakeClock.Advance(leap)
+	}
+	return now
+}
+
 // tickClock advances virtual time by one tick on EVERY observation, so the two
 // clock samples a "NowNS() + (deadline - Now())" conversion mixes can no longer
 // agree, and an attempt boundary derived from anything other than the context
@@ -146,6 +183,49 @@ func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
 	}
 	c.Advance(d)
 	return ctx.Err()
+}
+
+// descheduledCtx is the one thing a real context cannot express: the goroutine
+// running the WORK sees the caller's context end, while the goroutine running
+// the INTERCEPTOR has not yet been scheduled to hear about it. Err() reports the
+// end from the moment the test calls expire; the Done channel is never closed,
+// so a select parked on it stays parked exactly as a descheduled goroutine's
+// would.
+//
+// In a deployment the two are one instant, and which goroutine reacts first is a
+// scheduling race. This double pins the side of that race where the goroutine
+// that STAMPED the end of the work is also the one that claims it -- the only
+// side on which the worker's own classification of its work decides the record,
+// and therefore the only side on which it can be tested at all.
+type descheduledCtx struct {
+	context.Context
+	deadline time.Time
+	done     chan struct{}
+
+	mu  sync.Mutex
+	err error
+}
+
+func newDescheduledCtx(deadline time.Time) *descheduledCtx {
+	return &descheduledCtx{Context: context.Background(), deadline: deadline, done: make(chan struct{})}
+}
+
+func (c *descheduledCtx) Deadline() (time.Time, bool) { return c.deadline, true }
+
+func (c *descheduledCtx) Done() <-chan struct{} { return c.done }
+
+func (c *descheduledCtx) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+// expire is the caller's context ending: every goroutine that READS the context
+// sees it from here on, and one parked on Done() sees nothing yet.
+func (c *descheduledCtx) expire(err error) {
+	c.mu.Lock()
+	c.err = err
+	c.mu.Unlock()
 }
 
 // testLog is an attempt log in a temp directory plus a decoder for what landed
@@ -263,9 +343,9 @@ func newTestStateOn(t *testing.T, clock Clock, dir, service, doc string, schedul
 	t.Helper()
 	cfg, err := ParseConfig([]byte(doc), "test.yaml")
 	require.NoError(t, err)
-	reg, err := buildRegistry(cfg, sha256Hex([]byte(doc)), nil, clock)
-	require.NoError(t, err)
 	l := newTestLogIn(t, dir, service)
+	reg, err := buildRegistry(cfg, sha256Hex([]byte(doc)), nil, clock, l.attemptLog)
+	require.NoError(t, err)
 	s := &runtimeState{
 		service:    service,
 		configPath: "",

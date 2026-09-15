@@ -358,7 +358,7 @@ method_policies:
 `
 	cfg, err := ParseConfig([]byte(doc), "test.yaml")
 	require.NoError(t, err)
-	reg, err := buildRegistry(cfg, "sha", nil, newRealClock())
+	reg, err := buildRegistry(cfg, "sha", nil, newRealClock(), nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, 3*time.Second, reg.Lookup("hotels", testMethod).timeout)
@@ -371,7 +371,7 @@ method_policies:
 func TestRouteForUsesTheRoutesMapThenTheLowercasedPath(t *testing.T) {
 	cfg, err := ParseConfig([]byte("default_policy: a\nroutes:\n  SearchHandler: hotels\nprofiles:\n  a:\n    timeout: 1s\n"), "test.yaml")
 	require.NoError(t, err)
-	reg, err := buildRegistry(cfg, "sha", nil, newRealClock())
+	reg, err := buildRegistry(cfg, "sha", nil, newRealClock(), nil)
 	require.NoError(t, err)
 	assert.Equal(t, "hotels", reg.RouteFor("/SearchHandler"))
 	assert.Equal(t, "root", reg.RouteFor("/Root"))

@@ -2,6 +2,7 @@ package rpcpolicy
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,8 +72,115 @@ type ServerRecord struct {
 	AdmissionWorkersBusy int     `json:"admission_workers_busy"`
 	InjectedMS           float64 `json:"injected_ms"`
 	HandlerMS            float64 `json:"handler_ms"`
-	PermitReleasedAt     float64 `json:"permit_released_at"`
-	FaultHit             bool    `json:"fault_hit"`
+	// QueueDepthAtEnd is msim's `queue_size` argument to on_done: the length of
+	// this service's queue at the instant THIS attempt ended, which is what
+	// `queue_avg_at_attempt_end` averages on the simulator's side.
+	//
+	// It is a different measurement from admission_queue_depth, which is the
+	// depth the attempt saw when it ARRIVED. The two coincide on every outcome
+	// decided at admission (the attempt's end is its admission) and diverge for
+	// every attempt that was served: comparing msim's end-of-attempt average
+	// against a deployed admission-time depth compares two different quantities
+	// exactly where the queue is moving fastest.
+	//
+	// Per path, mirroring service.py: queue_len() for deadline_at_submit and
+	// queue_full; queue_len() - 1 for deadline_in_queue (an attempt is not part
+	// of the queue it observes); queue_len() after the slot came back for
+	// cancelled_in_queue; queue_len() after the pop for the deadline_at_dequeue
+	// tie; queue_len() before _start_next dispatches for every in-service end
+	// (a completion, a cut at the deadline, a cancel in service); and
+	// queue_len() at the finalize instant when the worker had already been
+	// handed back.
+	QueueDepthAtEnd int `json:"queue_depth_at_end"`
+	// OccupancyCensored is msim's occupancy_censored, and it is a statement
+	// about the WORKER OCCUPANCY this record reports, not about the handler: the
+	// permit was still held when the attempt was cut, so handler_ms (plus
+	// injected_ms) is a LOWER BOUND on the occupancy the server would have
+	// contributed and a censored-data estimator must not read it as a complete
+	// observation.
+	//
+	// True exactly where msim's _complete_attempt sets it: an attempt whose
+	// worker was still held when a DEADLINE or a CANCEL ended it, whether it was
+	// cut mid-handler, cut inside the injected latency, or found to have
+	// finished at or past its deadline (msim's _finish_service checks the
+	// deadline before it rolls anything, and books the tie as a DEADLINE).
+	//
+	// False when the handler ran to completion inside its deadline, false on
+	// every admission drop -- none of them ever held a worker -- and false when
+	// the permit had already been handed back by ReleasePermit before the cut:
+	// msim's early-release branch reports that occupancy as COMPLETE, because it
+	// ended at the hand-back and nothing truncated it.
+	OccupancyCensored bool    `json:"occupancy_censored"`
+	PermitReleasedAt  float64 `json:"permit_released_at"`
+	FaultHit          bool    `json:"fault_hit"`
+}
+
+// DiscardRecord is the station event that says WHEN an expired queue entry
+// really gave its slot back.
+//
+// An attempt whose caller-clock deadline passes while it waits is told at that
+// deadline, but it KEEPS its queue slot until the dispatcher reaches it and
+// drops it (msim's _start_next `if item.expired: continue`). Its own server
+// record is therefore written at the deadline and says nothing about the instant
+// the slot came back, and nothing else in the log marks it -- so the pipeline
+// cannot reconstruct queued(t) exactly. One discard event per entry the
+// dispatcher drops closes that gap.
+//
+// It carries the identity fields of that attempt's ServerRecord and nothing
+// else: it is not a span, it has no duration, no outcome and no code. `at_epoch`
+// is a float epoch second like end_epoch.
+type DiscardRecord struct {
+	Kind         string  `json:"kind"`
+	TraceID      string  `json:"trace_id"`
+	SpanID       string  `json:"span_id"`
+	ParentSpanID string  `json:"parent_span_id"`
+	Service      string  `json:"service"`
+	Operation    string  `json:"operation"`
+	AtEpoch      float64 `json:"at_epoch"`
+}
+
+// kindDiscard is the `kind` the pipeline selects discard events by, alongside
+// "client", "server", "root" and "event".
+const kindDiscard = "discard"
+
+// attemptID is how a station event names the attempt it is about: exactly the
+// identity fields that attempt's own ServerRecord carries, so the two join on
+// span_id.
+//
+// It reaches the station on the CONTEXT, like the deadline and the
+// cancellation: it is per-attempt data the server flow establishes before
+// admission, and the station only ever reads it. A station driven without one
+// (the package's own station tests) simply has nothing to name and writes no
+// station events.
+type attemptID struct {
+	traceID      string
+	spanID       string
+	parentSpanID string
+	service      string
+	operation    string
+}
+
+func (id attemptID) discardRecord(at time.Time) *DiscardRecord {
+	return &DiscardRecord{
+		Kind:         kindDiscard,
+		TraceID:      id.traceID,
+		SpanID:       id.spanID,
+		ParentSpanID: id.parentSpanID,
+		Service:      id.service,
+		Operation:    id.operation,
+		AtEpoch:      epochOf(at),
+	}
+}
+
+type attemptIDKey struct{}
+
+func withAttemptID(ctx context.Context, id attemptID) context.Context {
+	return context.WithValue(ctx, attemptIDKey{}, id)
+}
+
+func attemptIDFrom(ctx context.Context) attemptID {
+	id, _ := ctx.Value(attemptIDKey{}).(attemptID)
+	return id
 }
 
 // RootRecord is the front-door HTTP request.
