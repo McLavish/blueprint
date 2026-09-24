@@ -26,6 +26,9 @@ func initGeoDB(ctx context.Context, db backend.NoSQLDatabase) error {
 	if err != nil {
 		return err
 	}
+	if seeded, err := alreadySeeded(ctx, c); err != nil || seeded {
+		return err
+	}
 	err = c.InsertOne(ctx, &Point{"1", 37.7867, -122.4112})
 	if err != nil {
 		return err

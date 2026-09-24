@@ -30,12 +30,24 @@ func initReservationDB(ctx context.Context, db backend.NoSQLDatabase) error {
 	if err != nil {
 		return err
 	}
-	err = c.InsertOne(ctx, &Reservation{"4", "Alice", "2015-04-09", "2015-04-10", 1})
+	seeded, err := alreadySeeded(ctx, c)
 	if err != nil {
 		return err
 	}
+	if !seeded {
+		err = c.InsertOne(ctx, &Reservation{"4", "Alice", "2015-04-09", "2015-04-10", 1})
+		if err != nil {
+			return err
+		}
+	}
 
 	c, err = db.GetCollection(ctx, "reservation-db", "number")
+	if err != nil {
+		return err
+	}
+	if seeded, err := alreadySeeded(ctx, c); err != nil || seeded {
+		return err
+	}
 	err = c.InsertOne(ctx, &HotelNumber{"1", 200})
 	if err != nil {
 		return err

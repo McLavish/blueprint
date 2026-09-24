@@ -28,6 +28,9 @@ func initUserDB(ctx context.Context, userDB backend.NoSQLDatabase) error {
 	if err != nil {
 		return err
 	}
+	if seeded, err := alreadySeeded(ctx, c); err != nil || seeded {
+		return err
+	}
 	for i := 0; i <= 500; i++ {
 		suffix := strconv.Itoa(i)
 		user_name := "Cornell_" + suffix

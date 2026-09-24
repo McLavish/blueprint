@@ -25,6 +25,9 @@ func initRateDB(ctx context.Context, db backend.NoSQLDatabase) error {
 	if err != nil {
 		return err
 	}
+	if seeded, err := alreadySeeded(ctx, c); err != nil || seeded {
+		return err
+	}
 	err = c.InsertOne(ctx, &RatePlan{
 		"1",
 		"RACK",

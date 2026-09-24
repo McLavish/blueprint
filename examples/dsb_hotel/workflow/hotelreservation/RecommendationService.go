@@ -27,6 +27,9 @@ func initRecommendationDB(ctx context.Context, db backend.NoSQLDatabase) error {
 	if err != nil {
 		return err
 	}
+	if seeded, err := alreadySeeded(ctx, c); err != nil || seeded {
+		return err
+	}
 	err = c.InsertOne(ctx, &Hotel{"1", 37.7867, -122.4112, 109.00, 150.00})
 	if err != nil {
 		return err
