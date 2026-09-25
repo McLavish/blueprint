@@ -136,8 +136,13 @@ func (s *runtimeState) serve(ctx context.Context, req interface{}, fullMethod st
 			// Through the clock seam, like every other instant in the policy
 			// layer: the injected latency IS service time, so a test that drives
 			// virtual time must be able to spend it exactly rather than really
-			// sleeping through it.
-			if serr := s.clock.Sleep(ctx, injected); serr != nil {
+			// sleeping through it. The real clock spends it precisely
+			// (realClock.SleepPrecise): its plain timer runs ~0.6 ms long.
+			sleep := s.clock.Sleep
+			if precise, ok := s.clock.(preciseSleeper); ok {
+				sleep = precise.SleepPrecise
+			}
+			if serr := sleep(ctx, injected); serr != nil {
 				// Cut inside the injected latency: the handler never runs, and
 				// the classification below is the same in-service cut. The
 				// context's state is read BEFORE the stamp, as at the handler's

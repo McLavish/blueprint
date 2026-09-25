@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -66,6 +67,46 @@ func (c realClock) Sleep(ctx context.Context, d time.Duration) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// preciseSleeper is a Clock that can spend a duration exactly. The fault injector
+// prefers one (server.go): the latency it adds is service time, and the matched model
+// adds it to the nanosecond (msim `_adjust_latency`). Retry backoff keeps Sleep.
+type preciseSleeper interface {
+	SleepPrecise(ctx context.Context, d time.Duration) error
+}
+
+// injectionSpin is how much of an injected latency is spun rather than slept on a
+// timer. Go's timers wake up late by up to ~1 ms: on slimfly a 29 ms injection slept
+// 29.63 ms at the median (p10 +0.12, p90 +1.0 ms; hotel K16, 2026-09-25) -- 2 % of it,
+// but a third of the ~2 ms padding hotel's K17 station adds. Two milliseconds covers
+// the observed tail.
+const injectionSpin = 2 * time.Millisecond
+
+// SleepPrecise spends d as exactly as the scheduler allows: a timer for all but the
+// last injectionSpin, then a yielding spin to a deadline fixed when the call is made.
+// A cancelled context ends it in either phase, as it ends Sleep.
+func (c realClock) SleepPrecise(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	deadline := time.Now().Add(d)
+	if coarse := d - injectionSpin; coarse > 0 {
+		t := time.NewTimer(coarse)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		}
+	}
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		runtime.Gosched()
+	}
+	return nil
 }
 
 // WithTimeout implements Clock.
