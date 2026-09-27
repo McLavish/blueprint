@@ -10,11 +10,9 @@ import (
 	"time"
 )
 
-// Fault injection (docs/CONTRACTS.md §4), ported from
-// hotelreservation-experiments/faultinject/faultinject.go. The one behavioural
-// change is where it sits: INSIDE the admission permit, so injected latency
-// occupies a worker exactly as real service time does -- which is what makes
-// the deployed station and msim's station the same queue.
+// Fault injection (docs/CONTRACTS.md §4). It sits INSIDE the admission permit,
+// so injected latency occupies a worker exactly as real service time does --
+// which is what makes the deployed station and msim's station the same queue.
 
 // FaultSchedule is the whole file.
 type FaultSchedule struct {

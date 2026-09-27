@@ -13,10 +13,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// The policy YAML of docs/CONTRACTS.md §2, decoded strictly. Ported from
-// hotelreservation-experiments/resilience/config.go, with msim-native parameter
-// names so the interceptor and the matched simulator read the same numbers with
-// no mapping in between.
+// The policy YAML of docs/CONTRACTS.md §2, decoded strictly, with msim-native
+// parameter names so the interceptor and the matched simulator read the same
+// numbers with no mapping in between.
 
 // Config is one policy file: one document, one container.
 type Config struct {

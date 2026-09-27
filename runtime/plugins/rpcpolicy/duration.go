@@ -6,9 +6,8 @@ import (
 )
 
 // Duration is a time.Duration that unmarshals from a YAML scalar through
-// time.ParseDuration ("50ms", "1s", "0s"). Ported from
-// hotelreservation-experiments/resilience/duration.go, with the yaml.v3 node
-// API so a malformed value reports its line.
+// time.ParseDuration ("50ms", "1s", "0s"), with the yaml.v3 node API so a
+// malformed value reports its line.
 type Duration time.Duration
 
 // UnmarshalYAML implements yaml.Unmarshaler.
